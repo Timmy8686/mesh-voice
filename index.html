@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.3.5（最多4人）</title>
+  <title>Mesh 多人语音 v2.3.6（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.3.5 · 最多 4 人 · 掉线回登录 + 离开回填房间号</p>
+  <p class="subtitle">v2.3.6 · 最多 4 人 · 幽灵成员修复 + 文件上限200MB</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -384,12 +384,12 @@
         </div>
         <div class="chat-input-row">
           <input type="text" id="chatInput" placeholder="输入消息…" autocomplete="off" maxlength="2000" />
-          <button class="btn-file" id="btnFile" title="上传文档（≤100MB，分片传输）">📎
+          <button class="btn-file" id="btnFile" title="上传文档（≤200MB，分片传输）">📎
             <input type="file" id="fileInput" />
           </button>
           <button class="btn-primary" id="btnSendChat">发送</button>
         </div>
-        <p class="chat-hint">支持文本与文档互传（单文件 ≤100MB，分片传输）；一键全部退出或离开后，聊天与文件全部销毁。</p>
+        <p class="chat-hint">支持文本与文档互传（单文件 ≤200MB，分片传输）；一键全部退出或离开后，聊天与文件全部销毁。</p>
       </div>
     </div>
   </div>
@@ -482,7 +482,7 @@
     // 聊天（仅内存，不写 localStorage / 磁盘）
     var chatMessages = [];           // { id, from, name, text?, fileName?, fileUrl?, fileSize?, ts, type }
     var chatFileUrls = [];           // 需 revoke 的 ObjectURL
-    var MAX_FILE_BYTES = 100 * 1024 * 1024; // 100MB
+    var MAX_FILE_BYTES = 200 * 1024 * 1024; // 200MB
     var FILE_CHUNK_SIZE = 64 * 1024;      // 64KB：速度与稳定性折中
     var FILE_BUFFER_HIGH = 1.5 * 1024 * 1024; // ~1.5MB 背压阈值
     var FILE_PARALLEL = 3;                 // 同时在途分片数（小窗口并行）
@@ -492,7 +492,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.3.5';
+    var APP_VERSION = '2.3.6';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -529,22 +529,35 @@
       document.getElementById(id).classList.add('active');
     }
 
+    function isMemberVisible(id) {
+      if (!id || !members[id]) return false;
+      if (id === myId) return true;
+      // 只显示已确认，或当前仍有存活连接的成员，过滤幽灵账号
+      if (members[id].confirmed) return true;
+      if (typeof isPeerConnAlive === 'function' && (isPeerConnAlive(mediaConns[id]) || isPeerConnAlive(dataConns[id]))) return true;
+      return false;
+    }
+
     function memberCount() {
       var n = 0;
-      for (var k in members) if (members.hasOwnProperty(k)) n++;
+      for (var k in members) {
+        if (members.hasOwnProperty(k) && isMemberVisible(k)) n++;
+      }
       return n;
     }
 
     function ensureMember(id) {
       if (!members[id]) {
-        members[id] = { muted: false, speaking: false, network: 'unknown' };
+        members[id] = { muted: false, speaking: false, network: 'unknown', confirmed: false };
       }
       return members[id];
     }
 
     function updateUI() {
       var ids = [];
-      for (var k in members) if (members.hasOwnProperty(k)) ids.push(k);
+      for (var k in members) {
+        if (members.hasOwnProperty(k) && isMemberVisible(k)) ids.push(k);
+      }
 
       if (ids.length <= 1) {
         peersListEl.innerHTML = '<div style="text-align:center;color:var(--muted);padding:16px;">等待其他人加入...</div>';
@@ -1351,7 +1364,7 @@ function onMediaConn(conn) {
     function sendChatFile(file) {
       if (!file || !peer) return;
       if (file.size > MAX_FILE_BYTES) {
-        setStatus('文件过大（上限 100MB）', 'warning');
+        setStatus('文件过大（上限 200MB）', 'warning');
         return;
       }
       if (file.size === 0) {
@@ -2659,6 +2672,36 @@ function attemptRejoinRoom() {
 
       var asOwner = isRoomOwner(roomId);
 
+      // 进房前彻底清空旧会话状态，防止多次建房/旧 ID 残留导致多出幽灵参与者
+      try {
+        for (var _k in mediaConns) { try { mediaConns[_k].close(); } catch (e) {} }
+        for (var _k2 in dataConns) { try { dataConns[_k2].close(); } catch (e) {} }
+      } catch (e) {}
+      mediaConns = {};
+      dataConns = {};
+      members = {};
+      roomRoster = [];
+      if (peer) {
+        try { peer.destroy(); } catch (e) {}
+        peer = null;
+      }
+      myId = null;
+      isHost = false;
+      intentionalLeave = false;
+      isReconnecting = false;
+      clearReconnectTimer();
+      stopHostWatchdog();
+      if (softDisconnectTimer) {
+        clearTimeout(softDisconnectTimer);
+        softDisconnectTimer = null;
+      }
+      if (audioContainer) audioContainer.innerHTML = '';
+
+      // 创建者身份进入时，清掉该房间可能残留的「成员 ID」，避免同一浏览器以两种身份出现
+      if (asOwner) {
+        try { localStorage.removeItem('mesh4_member_' + roomId); } catch (e) {}
+      }
+
       unlockAudio();
       btnCreate.disabled = true;
       btnJoin.disabled = true;
@@ -2707,7 +2750,11 @@ function attemptRejoinRoom() {
           throw new Error('非创建者不能占用房间号');
         }
 
+        // 只登记自己，不预载历史 roster，避免幽灵账号
+        members = {};
+        roomRoster = [];
         ensureMember(myId);
+        members[myId].confirmed = true;
         members[myId].network = 'good';
         bindPeerRoomEvents(peer);
         resetRoomSessionFlags();
@@ -2830,14 +2877,30 @@ function attemptRejoinRoom() {
       saveActiveRoom();
     }
 
-    /** 清理长时间无连接的幽灵成员 */
+    /** 清理幽灵成员：未确认的直接删；已确认但连接彻底 failed/closed 的也删 */
     function pruneGhostMembers() {
       var changed = false;
       for (var id in members) {
         if (!members.hasOwnProperty(id) || id === myId) continue;
-        var alive = isPeerConnAlive(mediaConns[id]) || isPeerConnAlive(dataConns[id]);
-        if (!alive && !members[id].confirmed) {
+        var mConn = mediaConns[id];
+        var dConn = dataConns[id];
+        var alive = isPeerConnAlive(mConn) || isPeerConnAlive(dConn);
+        var hardDead = false;
+        try {
+          var pcs = [];
+          if (mConn && mConn.peerConnection) pcs.push(mConn.peerConnection);
+          if (dConn && dConn.peerConnection) pcs.push(dConn.peerConnection);
+          if (!mConn && !dConn) hardDead = true;
+          for (var pi = 0; pi < pcs.length; pi++) {
+            var st = pcs[pi].iceConnectionState || pcs[pi].connectionState || '';
+            if (st === 'failed' || st === 'closed') hardDead = true;
+          }
+        } catch (e) {}
+
+        if (!alive && (!members[id].confirmed || hardDead)) {
           delete members[id];
+          var ri = roomRoster.indexOf(id);
+          if (ri !== -1) roomRoster.splice(ri, 1);
           changed = true;
         }
       }
