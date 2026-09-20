@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.3.8（最多4人）</title>
+  <title>Mesh 多人语音 v2.3.11（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.3.8 · 最多 4 人 · 限制 PeerConnection 防爆</p>
+  <p class="subtitle">v2.3.11 · 最多 4 人 · 重进房间立即恢复语音</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -451,10 +451,10 @@
     ];
 
     // 音量检测：说话判定 + 噪声门限（低于此视为静音/白噪声，不发送）
-    var SPEAKING_THRESHOLD = 16;
-    var NOISE_GATE_THRESHOLD = 12;      // 低于此能量关闭发送增益，抑制白噪声
-    var NOISE_GATE_HOLD_MS = 280;       // 说话结束后延迟关闭，避免切断尾音
-    var SPEAKING_CHECK_INTERVAL = 80;   // ms，更快响应
+    var SPEAKING_THRESHOLD = 14;
+    var NOISE_GATE_THRESHOLD = 8;       // 更低门槛，开口更快出声
+    var NOISE_GATE_HOLD_MS = 200;       // 尾音保持略短
+    var SPEAKING_CHECK_INTERVAL = 40;   // 更频繁检测，降低开门延迟
 
     // 弱网优先：语音码率上限（bps），约 16~32kbps 对语音足够且更抗丢包
     var AUDIO_BITRATE_GOOD = 32000;
@@ -492,7 +492,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.3.8';
+    var APP_VERSION = '2.3.11';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -521,6 +521,7 @@
     var CONNECT_COOLDOWN_MS = 4000;    // 同一对象最短重连间隔
     var MESH_ALL_COOLDOWN_MS = 3000;   // 全员 mesh 最短间隔
     var MAX_PC_SOFT = 12;              // 本页软上限（媒体+数据），超则停止新建
+    var joinGraceUntil = 0;            // 进房宽限期：此时间前忽略冷却，强制建媒体
 
     var statusEl = document.getElementById('status');
     var peersListEl = document.getElementById('peersList');
@@ -625,7 +626,13 @@
       try {
         if (!audioCtx) {
           var AC = window.AudioContext || window.webkitAudioContext;
-          if (AC) audioCtx = new AC();
+          if (AC) {
+            try {
+              audioCtx = new AC({ latencyHint: 'interactive' });
+            } catch (e0) {
+              audioCtx = new AC();
+            }
+          }
         }
         if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
       } catch (e) {
@@ -717,7 +724,8 @@
         analyser.smoothingTimeConstant = 0.35;
 
         outboundGain = audioCtx.createGain();
-        outboundGain.gain.value = 0; // 默认噪声门关闭，有声音再打开
+        // 初始关闭抑制底噪；检测到人声后用极短时间打开，降低首音延迟
+        outboundGain.gain.value = 0;
 
         var dest = audioCtx.createMediaStreamDestination();
 
@@ -758,7 +766,13 @@
               noiseGateHoldTimer = null;
             }
             if (noiseGateClosed) {
-              outboundGain.gain.setTargetAtTime(1.0, audioCtx.currentTime, 0.02);
+              // 几乎立刻开门，避免对方扬声器晚半拍才响
+              try {
+                outboundGain.gain.cancelScheduledValues(audioCtx.currentTime);
+                outboundGain.gain.setValueAtTime(1.0, audioCtx.currentTime);
+              } catch (e) {
+                outboundGain.gain.setTargetAtTime(1.0, audioCtx.currentTime, 0.005);
+              }
               noiseGateClosed = false;
             }
           } else {
@@ -977,6 +991,21 @@
       }
     }
 
+    function ensureRemoteAudioPlaying(peerId) {
+      var audio = document.getElementById('audio-' + peerId);
+      if (!audio) return;
+      try {
+        audio.muted = false;
+        audio.volume = 1.0;
+        if (audio.paused) {
+          var p = audio.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch(function() {});
+          }
+        }
+      } catch (e) {}
+    }
+
     function playRemoteStream(stream, peerId) {
       var audioId = 'audio-' + peerId;
       var audio = document.getElementById(audioId);
@@ -991,57 +1020,87 @@
         audio.volume = 1.0;
         audioContainer.appendChild(audio);
       }
-      try { audio.pause(); } catch (e) {}
-      audio.srcObject = stream;
+      // 避免 pause 造成可感知停顿；仅在流变化时替换
+      if (audio.srcObject !== stream) {
+        audio.srcObject = stream;
+      }
+      audio.muted = false;
+      audio.volume = 1.0;
 
-      // 开始监听远端音量（用于「正在说话」）
       unlockAudio();
       startVolumeMonitor(peerId, stream, false);
 
-      var p = audio.play();
-      if (p && typeof p.then === 'function') {
-        p.then(function() {
-          console.log('音频播放成功:', peerId);
-        }).catch(function() {
-          audio.muted = true;
-          audio.play().then(function() {
-            setTimeout(function() { audio.muted = false; }, 300);
+      function tryPlay(attempt) {
+        attempt = attempt || 0;
+        var p = audio.play();
+        if (p && typeof p.then === 'function') {
+          p.then(function() {
+            audio.muted = false;
+            audio.volume = 1.0;
           }).catch(function() {
-            setStatus('请点击页面任意处以启用声音', 'warning');
+            if (attempt < 3) {
+              setTimeout(function() { tryPlay(attempt + 1); }, 80 * (attempt + 1));
+            } else {
+              setStatus('请点击页面任意处以启用声音', 'warning');
+            }
           });
-        });
+        }
       }
+      tryPlay(0);
+      // 短延迟再确保一次，防止部分浏览器首帧未起播
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 120);
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 500);
     }
 
-    function createPeerInstance(desiredId) {
+    function isPeerIdBusyError(err) {
+      var msg = (err && (err.type || err.message || '')) + '';
+      var t = (err && err.type) ? String(err.type) : '';
+      return t === 'unavailable-id' ||
+        msg.indexOf('unavailable') !== -1 ||
+        msg.indexOf('is taken') !== -1 ||
+        msg.indexOf('taken') !== -1 ||
+        msg.indexOf('ID is taken') !== -1;
+    }
+
+    /** @param timeoutMs 单次占用超时，默认 12s；抢房间号用更短 */
+    function createPeerInstance(desiredId, timeoutMs) {
+      timeoutMs = timeoutMs || 12000;
       return new Promise(function(resolve, reject) {
         if (typeof Peer === 'undefined') {
           reject(new Error('PeerJS 库未加载成功，请刷新页面或更换网络后重试'));
           return;
         }
 
+        var settled = false;
         var p = new Peer(desiredId, {
           debug: 1,
           config: {
             iceServers: ICE_SERVERS,
             sdpSemantics: 'unified-plan',
             iceCandidatePoolSize: 4,
-            // 弱网时更耐用的 bundle / rtcp-mux 由浏览器默认处理
             iceTransportPolicy: 'all'
           }
         });
 
         var timer = setTimeout(function() {
+          if (settled) return;
+          settled = true;
+          try { p.destroy(); } catch (e) {}
           reject(new Error('连接 Peer 服务器超时，请检查网络'));
-        }, 18000);
+        }, timeoutMs);
 
         p.on('open', function(id) {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
           resolve(p);
         });
 
         p.on('error', function(err) {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
+          try { p.destroy(); } catch (e) {}
           reject(err);
         });
       });
@@ -1137,7 +1196,11 @@ function onMediaConn(conn) {
           members[rid].confirmed = true;
         }
         rosterAdd(rid);
+        try { unlockAudio(); } catch (e) {}
         playRemoteStream(stream, rid);
+        setTimeout(function() { ensureRemoteAudioPlaying(rid); }, 50);
+        setTimeout(function() { ensureRemoteAudioPlaying(rid); }, 300);
+        setTimeout(function() { ensureRemoteAudioPlaying(rid); }, 1000);
         updateUI();
         if (roomHostId && rid === roomHostId && !isRoomNode) {
           onHostLinked('media-stream');
@@ -1965,6 +2028,11 @@ function onMediaConn(conn) {
           if (typeof data.speaking === 'boolean' && !volumeMonitors[rid]) {
             members[rid].speaking = data.speaking;
           }
+          // 对方开始说话或取消静音时，确保本机扬声器在播
+          if (data.speaking || data.muted === false) {
+            try { ensureRemoteAudioPlaying(rid); } catch (e) {}
+            try { unlockAudio(); } catch (e2) {}
+          }
           updateUI();
         }
 
@@ -2101,11 +2169,12 @@ function onMediaConn(conn) {
       if (!peer || intentionalLeave) return;
 
       var now = Date.now();
-      // 冷却：同一目标短时间不重复发起
-      if (!force && lastConnectAt[remoteId] && (now - lastConnectAt[remoteId] < CONNECT_COOLDOWN_MS)) {
+      var inJoinGrace = now < joinGraceUntil;
+      // 冷却：同一目标短时间不重复发起（进房宽限期内忽略，避免重进后长时间无声）
+      if (!force && !inJoinGrace && lastConnectAt[remoteId] && (now - lastConnectAt[remoteId] < CONNECT_COOLDOWN_MS)) {
         return;
       }
-      if (pendingConnect[remoteId] && (now - pendingConnect[remoteId] < CONNECT_COOLDOWN_MS)) {
+      if (!force && !inJoinGrace && pendingConnect[remoteId] && (now - pendingConnect[remoteId] < CONNECT_COOLDOWN_MS)) {
         return;
       }
 
@@ -2268,20 +2337,18 @@ function onMediaConn(conn) {
     function createPeerWithRetry(desiredId, retries, forceSameId) {
       retries = retries || 0;
       forceSameId = !!forceSameId;
-      return createPeerInstance(desiredId).catch(function(err) {
-        var msg = (err && (err.type || err.message || '')) + '';
-        var idBusy = msg.indexOf('unavailable') !== -1 || msg.indexOf('taken') !== -1 ||
-          msg.indexOf('ID') !== -1 || msg.indexOf('is taken') !== -1;
-        if (idBusy && retries < (forceSameId ? 6 : 2)) {
+      return createPeerInstance(desiredId, forceSameId ? 5000 : 10000).catch(function(err) {
+        var idBusy = isPeerIdBusyError(err);
+        if (idBusy && retries < (forceSameId ? 2 : 2)) {
           if (forceSameId) {
-            console.warn('重连：ID 暂占用，稍后仍用原 ID 重试', desiredId, retries);
+            console.warn('重连：ID 暂占用，短暂重试', desiredId, retries);
             return new Promise(function(resolve, reject) {
               setTimeout(function() {
                 createPeerWithRetry(desiredId, retries + 1, true).then(resolve, reject);
-              }, 800 + retries * 400);
+              }, 400);
             });
           }
-          console.warn('ID 暂不可用，换新 ID 重试:', desiredId, msg);
+          console.warn('ID 暂不可用，换新 ID 重试:', desiredId);
           return createPeerWithRetry(genMeshId(), retries + 1, false);
         }
         throw err;
@@ -2786,21 +2853,33 @@ function attemptRejoinRoom() {
      * 仅「创建者」可占用房间号作为 Peer ID。
      * 参与者永远使用独立连接 ID，禁止抢占房间号（否则创建者无法再进）。
      */
-    function claimRoomIdAsHost(roomId, retriesLeft) {
-      retriesLeft = retriesLeft === undefined ? 10 : retriesLeft;
-      return createPeerInstance(roomId).then(function(p) {
+    /**
+     * 占用房间号。
+     * - 若 ID 明确已被占用：立即失败（不再长时间等待释放）
+     * - 仅对超时/瞬时错误做极短重试
+     * retriesLeft 默认 2；单次超时 4s
+     */
+    function claimRoomIdAsHost(roomId, retriesLeft, perTryMs) {
+      retriesLeft = retriesLeft === undefined ? 2 : retriesLeft;
+      perTryMs = perTryMs || 4000;
+      return createPeerInstance(roomId, perTryMs).then(function(p) {
         if (p.id !== roomId) {
           try { p.destroy(); } catch (e) {}
           throw new Error('ID mismatch');
         }
         return p;
       }).catch(function(err) {
+        // 已被占用：直接失败，由上层降级为成员，不空等释放
+        if (isPeerIdBusyError(err)) {
+          console.warn('房间号已被占用，停止等待', roomId, err);
+          throw err;
+        }
         if (retriesLeft <= 0) throw err;
-        setStatus('等待房间号释放并重新占用（剩余 ' + retriesLeft + '）…', 'warning');
+        setStatus('信令繁忙，快速重试占用（剩余 ' + retriesLeft + '）…', 'warning');
         return new Promise(function(resolve, reject) {
           setTimeout(function() {
-            claimRoomIdAsHost(roomId, retriesLeft - 1).then(resolve, reject);
-          }, 800);
+            claimRoomIdAsHost(roomId, retriesLeft - 1, perTryMs).then(resolve, reject);
+          }, 300);
         });
       });
     }
@@ -2823,6 +2902,10 @@ function attemptRejoinRoom() {
       dataConns = {};
       members = {};
       roomRoster = [];
+      pendingConnect = {};
+      lastConnectAt = {};
+      lastMeshAllAt = 0;
+      joinGraceUntil = Date.now() + 12000; // 重进后 12 秒内优先恢复语音
       if (peer) {
         try { peer.destroy(); } catch (e) {}
         peer = null;
@@ -2853,13 +2936,16 @@ function attemptRejoinRoom() {
 
       getMic().then(function(stream) {
         if (asOwner) {
-          // ---------- 创建者：优先占用房间号；若已被新节点占用则降级为成员 ----------
-          setStatus('创建者进入：占用房间号 ' + roomId + ' …');
-          return claimRoomIdAsHost(roomId, 6).then(function(p) {
+          // ---------- 创建者：快速尝试占用；占用失败立即成员身份进房 ----------
+          setStatus('创建者进入：尝试占用房间号…');
+          return claimRoomIdAsHost(roomId, 1, 3500).then(function(p) {
             startVolumeMonitor(roomId, stream, true);
             return { p: p, asHost: true };
-          }).catch(function() {
-            setStatus('房间号已被其他节点占用，以成员身份加入…', 'warning');
+          }).catch(function(err) {
+            var busy = isPeerIdBusyError(err);
+            setStatus(busy
+              ? '房间号使用中，立即以成员身份加入…'
+              : '未能占用房间号，以成员身份加入…', 'warning');
             var memberId = getStableMemberId(roomId);
             startVolumeMonitor(memberId, stream, true);
             return createPeerWithRetry(memberId, 0, true).then(function(p) {
@@ -2922,14 +3008,15 @@ function attemptRejoinRoom() {
         } catch (e) {}
         saveActiveRoom();
 
-        if (!isHost) {
-          // 进房只连房间号；名单里的旧 ID 不立刻全连，避免幽灵用户与误踢
-          connectTo(roomId);
+        // 进房后立刻强制建媒体（忽略冷却），避免「状态在、声音没有」
+        try { unlockAudio(); } catch (e) {}
+        if (!isRoomNode) {
+          try { connectTo(roomId, true); } catch (e) {}
         }
 
         var roomDisp = document.getElementById('roomIdDisplay');
         if (roomDisp) roomDisp.textContent = roomId;
-        document.getElementById('myIdDisplay').textContent = myId + (isHost ? '（创建者/房间节点）' : '（成员）');
+        document.getElementById('myIdDisplay').textContent = myId + (isRoomNode ? '（房间节点）' : '（成员）');
         destroyChatCompletely();
         showSection('roomSection');
         updateUI();
@@ -2938,16 +3025,30 @@ function attemptRejoinRoom() {
           setStatus('已进入（房间节点）。等待成员连接；支持全员互连', 'connected');
         } else {
           startHostWatchdog();
-          setStatus('已进入（成员）。连接房间节点并与其他成员互连', 'connected');
-          setTimeout(function() { try { meshConnectAll(); } catch (e) {} }, 1500);
+          setStatus('已进入（成员）。正在建立语音…', 'connected');
         }
 
-        setTimeout(function() {
-          if (!intentionalLeave && peer && !isRoomNode) {
-            connectTo(roomId);
-            try { meshConnectAll(); } catch (e) {}
+        // 进房宽限期内多次补连，缩短无声窗口
+        function boostMedia(reason) {
+          if (intentionalLeave || !peer) return;
+          try { unlockAudio(); } catch (e) {}
+          if (!isRoomNode && roomHostId) {
+            try { connectTo(roomHostId, true); } catch (e) {}
           }
-        }, 2000);
+          try { meshConnectAll(); } catch (e2) {}
+          // 已有远端流则确保扬声器在播
+          try {
+            for (var pid in mediaConns) {
+              if (!mediaConns.hasOwnProperty(pid)) continue;
+              ensureRemoteAudioPlaying(pid);
+            }
+          } catch (e3) {}
+          console.log('boostMedia', reason);
+        }
+        setTimeout(function() { boostMedia('t200'); }, 200);
+        setTimeout(function() { boostMedia('t800'); }, 800);
+        setTimeout(function() { boostMedia('t2000'); }, 2000);
+        setTimeout(function() { boostMedia('t4000'); }, 4000);
         // 若进入后一段时间仍无房间节点，成员可竞选接管，使空房也能被新成员加入
         setTimeout(function() {
           if (!intentionalLeave && peer && !isRoomNode && roomHostId) {
@@ -3050,7 +3151,7 @@ function attemptRejoinRoom() {
     function meshConnectAll() {
       if (!peer || intentionalLeave) return;
       var now = Date.now();
-      if (now - lastMeshAllAt < MESH_ALL_COOLDOWN_MS) return;
+      if (now >= joinGraceUntil && now - lastMeshAllAt < MESH_ALL_COOLDOWN_MS) return;
       lastMeshAllAt = now;
 
       var targets = {};
@@ -3149,7 +3250,7 @@ function attemptRejoinRoom() {
       // 短暂等待信令释放旧 ID 后占用房间号
       setTimeout(function() {
         if (intentionalLeave) { electionInProgress = false; return; }
-        claimRoomIdAsHost(roomHostId, 8).then(function(p) {
+        claimRoomIdAsHost(roomHostId, 2, 4000).then(function(p) {
           peer = p;
           myId = p.id;
           isRoomNode = true;
@@ -3273,7 +3374,23 @@ function attemptRejoinRoom() {
         });
       }
       if (outboundGain && audioCtx) {
-        outboundGain.gain.setTargetAtTime(isMuted ? 0 : (noiseGateClosed ? 0 : 1), audioCtx.currentTime, 0.02);
+        try {
+          outboundGain.gain.cancelScheduledValues(audioCtx.currentTime);
+          if (isMuted) {
+            outboundGain.gain.setValueAtTime(0, audioCtx.currentTime);
+            noiseGateClosed = true;
+          } else {
+            // 取消静音后立即开门，避免对方扬声器要等噪声门再检测到才响
+            outboundGain.gain.setValueAtTime(1.0, audioCtx.currentTime);
+            noiseGateClosed = false;
+            if (noiseGateHoldTimer) {
+              clearTimeout(noiseGateHoldTimer);
+              noiseGateHoldTimer = null;
+            }
+          }
+        } catch (e) {
+          outboundGain.gain.setTargetAtTime(isMuted ? 0 : 1, audioCtx.currentTime, 0.01);
+        }
       }
       document.getElementById('btnMute').textContent = isMuted ? '取消静音' : '静音';
 
