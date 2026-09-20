@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.3.2（最多4人）</title>
+  <title>Mesh 多人语音 v2.3.4（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.3.2 · 最多 4 人 · 成员列表与稳定性修复 · 聊天与文档</p>
+  <p class="subtitle">v2.3.4 · 最多 4 人 · 创建者重连状态修复 · 聊天与文档</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -483,15 +483,16 @@
     var chatMessages = [];           // { id, from, name, text?, fileName?, fileUrl?, fileSize?, ts, type }
     var chatFileUrls = [];           // 需 revoke 的 ObjectURL
     var MAX_FILE_BYTES = 100 * 1024 * 1024; // 100MB
-    var FILE_CHUNK_SIZE = 64 * 1024;     // 64KB 二进制分片，提高吞吐
-    var FILE_BUFFER_HIGH = 2 * 1024 * 1024; // 缓冲超过 2MB 再节流，减少无谓等待
+    var FILE_CHUNK_SIZE = 64 * 1024;      // 64KB：速度与稳定性折中
+    var FILE_BUFFER_HIGH = 1.5 * 1024 * 1024; // ~1.5MB 背压阈值
+    var FILE_PARALLEL = 3;                 // 同时在途分片数（小窗口并行）
     var fileTransferBusy = false;
     var outgoingFileQueue = [];
-    var activeSendCancel = false;        // 用户取消当前发送
+    var activeSendCancel = false;
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.3.2';
+    var APP_VERSION = '2.3.4';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -1113,6 +1114,11 @@ function onMediaConn(conn) {
         }
         playRemoteStream(stream, rid);
         updateUI();
+        if (roomHostId && rid === roomHostId && !isHost) {
+          onHostLinked('media-stream');
+        } else if (!isHost && rid !== myId) {
+          setStatus('已与成员建立语音', 'connected');
+        }
         try { broadcastSync(); } catch (e) {}
       });
 
@@ -1128,12 +1134,13 @@ function onMediaConn(conn) {
         if (roomHostId && rid === roomHostId && !isHost && !intentionalLeave) {
           if (members[rid]) members[rid].network = 'poor';
           updateUI();
-          setStatus('创建者暂时离开，将自动尝试连回房间号…', 'warning');
+          onHostUnlinked('media-close');
+          setStatus('创建者暂时离开，正在尝试重连…', 'warning');
           hostConnectFailStreak = 0;
           hostConnectBackoffUntil = 0;
           setTimeout(function() {
             if (!intentionalLeave && peer && !isHost) forceConnectTo(roomHostId);
-          }, 1500);
+          }, 1200);
           return;
         }
         delete members[rid];
@@ -1375,25 +1382,85 @@ function onMediaConn(conn) {
       return list;
     }
 
+    function getDataChannel(conn) {
+      if (!conn) return null;
+      try {
+        if (conn.dataChannel) return conn.dataChannel;
+        if (conn._channel) return conn._channel;
+        if (conn.peerConnection) {
+          var pcs = conn.peerConnection.getSenders ? null : null;
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    function getConnBufferedAmount(conn) {
+      try {
+        var dc = getDataChannel(conn);
+        if (dc && typeof dc.bufferedAmount === 'number') return dc.bufferedAmount;
+        if (typeof conn.bufferSize === 'number') return conn.bufferSize;
+      } catch (e) {}
+      return 0;
+    }
+
+    function armBufferedAmountLow(conn) {
+      try {
+        var dc = getDataChannel(conn);
+        if (dc && dc.bufferedAmountLowThreshold !== undefined) {
+          dc.bufferedAmountLowThreshold = Math.floor(FILE_BUFFER_HIGH / 3);
+        }
+      } catch (e) {}
+    }
+
+    /** 背压：优先等 bufferedamountlow，避免盲等 */
     function waitConnDrain(conn, timeoutMs) {
       return new Promise(function(resolve) {
-        var t0 = Date.now();
-        timeoutMs = timeoutMs || 5000;
-        function check() {
-          if (!conn || !conn.open) return resolve(false);
-          var buf = 0;
-          try {
-            if (conn.dataChannel && typeof conn.dataChannel.bufferedAmount === 'number') {
-              buf = conn.dataChannel.bufferedAmount;
-            } else if (typeof conn.bufferSize === 'number') {
-              buf = conn.bufferSize;
-            }
-          } catch (e) {}
-          if (buf < FILE_BUFFER_HIGH) return resolve(true);
-          if (Date.now() - t0 > timeoutMs) return resolve(true);
-          setTimeout(check, 20);
+        timeoutMs = timeoutMs || 4000;
+        if (!conn || !conn.open) return resolve(false);
+        if (getConnBufferedAmount(conn) < FILE_BUFFER_HIGH) return resolve(true);
+
+        var dc = getDataChannel(conn);
+        var done = false;
+        var timer = setTimeout(function() {
+          if (done) return;
+          done = true;
+          resolve(true);
+        }, timeoutMs);
+
+        function finish() {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve(true);
         }
-        check();
+
+        if (dc && typeof dc.addEventListener === 'function') {
+          armBufferedAmountLow(conn);
+          var onLow = function() {
+            if (getConnBufferedAmount(conn) < FILE_BUFFER_HIGH) {
+              try { dc.removeEventListener('bufferedamountlow', onLow); } catch (e) {}
+              finish();
+            }
+          };
+          try {
+            dc.addEventListener('bufferedamountlow', onLow);
+          } catch (e) {
+            finish();
+          }
+          // 若已在阈值下
+          if (getConnBufferedAmount(conn) < FILE_BUFFER_HIGH) {
+            try { dc.removeEventListener('bufferedamountlow', onLow); } catch (e2) {}
+            finish();
+          }
+          return;
+        }
+
+        // 降级轮询
+        (function poll() {
+          if (done) return;
+          if (!conn.open || getConnBufferedAmount(conn) < FILE_BUFFER_HIGH) return finish();
+          setTimeout(poll, 25);
+        })();
       });
     }
 
@@ -1412,6 +1479,7 @@ function onMediaConn(conn) {
       var sent = 0, failed = 0;
       for (var i = 0; i < peerList.length; i++) {
         try {
+          armBufferedAmountLow(peerList[i].conn);
           peerList[i].conn.send(payload);
           sent++;
         } catch (e) {
@@ -1433,6 +1501,7 @@ function onMediaConn(conn) {
       var mime = file.type || 'application/octet-stream';
       var ts = Date.now();
       var acks = {};
+      var lastUiPct = -1;
 
       var localUrl = '';
       try {
@@ -1467,7 +1536,19 @@ function onMediaConn(conn) {
         pumpFileQueue();
       }
 
-      // 缩短建连等待，尽快开传
+      function updateProgress(sentCount, peerN) {
+        var pct = Math.min(100, Math.round((sentCount / totalChunks) * 100));
+        // 每约 8% 或首尾刷新 UI，减轻主线程压力
+        if (pct < 100 && lastUiPct >= 0 && pct - lastUiPct < 8) return;
+        lastUiPct = pct;
+        updateChatMsgById(fileId, {
+          fileStatus: '发送中 ' + pct + '%（' + sentCount + '/' + totalChunks + '）· 通道 ' + peerN,
+          canCancel: true,
+          fileStatusErr: peerN === 0
+        });
+        setStatus('发送中 ' + file.name + ' · ' + pct + '%', 'warning');
+      }
+
       setTimeout(function() {
         if (activeSendCancel) {
           finishSend('已取消发送', true, false);
@@ -1480,6 +1561,8 @@ function onMediaConn(conn) {
           setStatus('无法发送文件：无数据通道', 'error');
           return;
         }
+
+        peers.forEach(function(p) { armBufferedAmountLow(p.conn); });
 
         sendPayloadToPeers({
           type: 'file-meta',
@@ -1494,14 +1577,30 @@ function onMediaConn(conn) {
         }, peers);
 
         updateChatMsgById(fileId, {
-          fileStatus: '发送中 0% · 目标 ' + peers.length + ' 人',
+          fileStatus: '发送中 0% · 并行窗口 ' + FILE_PARALLEL + ' · 目标 ' + peers.length + ' 人',
           canCancel: true
         });
         setStatus('正在发送: ' + file.name, 'warning');
 
-        var index = 0;
+        var nextIndex = 0;
+        var inFlight = 0;
+        var completed = 0;
+        var ended = false;
 
-        function sendLoop() {
+        function readChunk(idx) {
+          return new Promise(function(resolve, reject) {
+            var startOff = idx * FILE_CHUNK_SIZE;
+            var slice = file.slice(startOff, startOff + FILE_CHUNK_SIZE);
+            var reader = new FileReader();
+            reader.onload = function() { resolve(reader.result); };
+            reader.onerror = function() { reject(new Error('read fail')); };
+            reader.readAsArrayBuffer(slice);
+          });
+        }
+
+        function finishAll() {
+          if (ended) return;
+          ended = true;
           if (activeSendCancel) {
             try {
               sendPayloadToPeers({ type: 'file-cancel', id: fileId, from: myId }, getOpenDataConnList());
@@ -1510,83 +1609,82 @@ function onMediaConn(conn) {
             setStatus('已取消文件发送', 'warning');
             return;
           }
+          sendPayloadToPeers({ type: 'file-end', id: fileId, from: myId }, getOpenDataConnList());
+          window.__meshFileAcks = window.__meshFileAcks || {};
+          window.__meshFileAcks[fileId] = acks;
+          finishSend('发送完成 · 已发出全部 ' + totalChunks + ' 片', false, true);
+          setStatus('文件已发送: ' + file.name, 'connected');
+          setTimeout(function() {
+            var ackN = 0;
+            for (var p in acks) if (acks[p]) ackN++;
+            if (ackN > 0) {
+              updateChatMsgById(fileId, {
+                fileStatus: '发送完成 · ' + ackN + ' 人已确认接收',
+                fileStatusDone: true,
+                canCancel: false
+              });
+            }
+          }, 2500);
+        }
 
-          if (index >= totalChunks) {
-            sendPayloadToPeers({ type: 'file-end', id: fileId, from: myId }, getOpenDataConnList());
-            window.__meshFileAcks = window.__meshFileAcks || {};
-            window.__meshFileAcks[fileId] = acks;
-            // 不等久确认，先标完成；若有 ack 再更新
-            finishSend('发送完成 · 已发出全部 ' + totalChunks + ' 片', false, true);
-            setStatus('文件已发送: ' + file.name, 'connected');
-            setTimeout(function() {
-              var ackN = 0;
-              for (var p in acks) if (acks[p]) ackN++;
-              if (ackN > 0) {
-                updateChatMsgById(fileId, {
-                  fileStatus: '发送完成 · ' + ackN + ' 人已确认接收',
-                  fileStatusDone: true,
-                  canCancel: false
-                });
-              }
-            }, 3000);
+        function pump() {
+          if (ended) return;
+          if (activeSendCancel) {
+            finishAll();
+            return;
+          }
+          peers = getOpenDataConnList();
+          if (!peers.length && completed < totalChunks) {
+            finishSend('发送中断：数据通道全部断开', true, false);
+            ended = true;
             return;
           }
 
-          var startOff = index * FILE_CHUNK_SIZE;
-          var slice = file.slice(startOff, startOff + FILE_CHUNK_SIZE);
-          var reader = new FileReader();
-          reader.onload = function() {
-            if (activeSendCancel) {
-              sendLoop();
-              return;
-            }
-            var buf = reader.result;
-            peers = getOpenDataConnList();
-            if (!peers.length) {
-              finishSend('发送中断：数据通道全部断开', true, false);
-              return;
-            }
-            // 仅在缓冲很高时等待，平时直接发
-            var drains = peers.map(function(p) { return waitConnDrain(p.conn, 3000); });
-            Promise.all(drains).then(function() {
-              if (activeSendCancel) {
-                sendLoop();
-                return;
-              }
-              peers = getOpenDataConnList();
-              var r = sendPayloadToPeers({
-                type: 'file-chunk',
-                id: fileId,
-                index: index,
-                data: buf
-              }, peers);
-              index++;
-              var pct = Math.min(100, Math.round((index / totalChunks) * 100));
-              if (index % 2 === 0 || index >= totalChunks) {
-                updateChatMsgById(fileId, {
-                  fileStatus: '发送中 ' + pct + '%（' + index + '/' + totalChunks + '）· 通道 ' + r.sent,
-                  fileStatusErr: r.sent === 0,
-                  canCancel: true
+          while (inFlight < FILE_PARALLEL && nextIndex < totalChunks && !activeSendCancel) {
+            (function(idx) {
+              inFlight++;
+              readChunk(idx).then(function(buf) {
+                if (activeSendCancel) {
+                  inFlight--;
+                  pump();
+                  return null;
+                }
+                // 所有对端背压就绪后再发这一片
+                return Promise.all(peers.map(function(p) {
+                  return waitConnDrain(p.conn, 4000);
+                })).then(function() {
+                  if (activeSendCancel) return;
+                  peers = getOpenDataConnList();
+                  var r = sendPayloadToPeers({
+                    type: 'file-chunk',
+                    id: fileId,
+                    index: idx,
+                    data: buf
+                  }, peers);
+                  return r;
                 });
-                if (index % 8 === 0) setStatus('发送中 ' + file.name + ' · ' + pct + '%', 'warning');
-              }
-              // 有通道则立即下一片，尽量跑满带宽
-              if (r.sent) {
-                if (typeof queueMicrotask === 'function') queueMicrotask(sendLoop);
-                else setTimeout(sendLoop, 0);
-              } else {
-                setTimeout(sendLoop, 80);
-              }
-            });
-          };
-          reader.onerror = function() {
-            finishSend('读取文件失败', true, false);
-            setStatus('读取文件失败', 'error');
-          };
-          reader.readAsArrayBuffer(slice);
+              }).then(function() {
+                inFlight--;
+                completed++;
+                updateProgress(completed, getOpenDataConnList().length);
+                if (completed >= totalChunks && inFlight === 0) finishAll();
+                else pump();
+              }).catch(function(err) {
+                console.warn('chunk send error', err);
+                inFlight--;
+                if (activeSendCancel) {
+                  finishAll();
+                  return;
+                }
+                // 单片失败：略延迟后继续泵，避免整文件卡死
+                setTimeout(pump, 50);
+              });
+            })(nextIndex++);
+          }
         }
-        sendLoop();
-      }, 120);
+
+        pump();
+      }, 100);
     }
 
     function finalizeIncomingFile(id) {
@@ -1822,6 +1920,9 @@ function onMediaConn(conn) {
           members[rid].network = members[rid].network || 'good';
         }
         updateUI();
+        if (roomHostId && rid === roomHostId && !isHost) {
+          onHostLinked('data-open');
+        }
         sendSync(conn);
         sendStatus(conn);
       });
@@ -2261,6 +2362,8 @@ function onMediaConn(conn) {
     var hostConnectBackoffUntil = 0;
     var hostConnectFailStreak = 0;
     var lastHostConnectStatusAt = 0;
+    var hostHalfOpenSince = 0;
+    var hostLinkedFlag = false;
 
     function stopHostWatchdog() {
       if (hostWatchdogTimer) {
@@ -2269,13 +2372,36 @@ function onMediaConn(conn) {
       }
       hostConnectFailStreak = 0;
       hostConnectBackoffUntil = 0;
+      hostHalfOpenSince = 0;
+      hostLinkedFlag = false;
+    }
+
+    /** 成员已与创建者（房间号）连通：立刻更新状态，去掉「稍后重试」残留文案 */
+    function onHostLinked(reason) {
+      if (isHost || !roomHostId) return;
+      hostConnectFailStreak = 0;
+      hostConnectBackoffUntil = 0;
+      hostHalfOpenSince = 0;
+      if (!hostLinkedFlag) {
+        hostLinkedFlag = true;
+        try { setNetworkQuality('good'); } catch (e) {}
+        setStatus('已连接创建者', 'connected');
+        console.log('onHostLinked', reason || '');
+      }
+      try { updateUI(); } catch (e2) {}
+    }
+
+    function onHostUnlinked(reason) {
+      hostLinkedFlag = false;
+      hostHalfOpenSince = Date.now();
+      console.log('onHostUnlinked', reason || '');
     }
 
     /**
-     * 成员连回创建者：弱网下防抖
-     * - 连接稳定：不动作
-     * - 仅 disconnected/checking：交给 ICE 自愈，不强拆强连
-     * - 确实 failed/无连接：退避后 forceConnect（2s→4s→8s…上限 20s）
+     * 成员连回创建者
+     * - 稳定：onHostLinked（清除「稍后重试」）
+     * - 半开超过 6s：强制重连（修复 disconnected 被当成 alive 而不重试）
+     * - 无连接：退避 forceConnect
      */
     function startHostWatchdog() {
       stopHostWatchdog();
@@ -2289,36 +2415,47 @@ function onMediaConn(conn) {
         var d = dataConns[roomHostId];
         var stable = isPeerConnStable(m) || isPeerConnStable(d);
         if (stable) {
-          hostConnectFailStreak = 0;
-          hostConnectBackoffUntil = 0;
+          onHostLinked('watchdog-stable');
           return;
         }
+
+        if (hostLinkedFlag) onHostUnlinked('lost-stable');
 
         var alive = isPeerConnAlive(m) || isPeerConnAlive(d);
-        if (alive) {
-          // 弱网闪断：不 force，避免反复呼叫
+        var now = Date.now();
+
+        if (alive && !stable) {
+          if (!hostHalfOpenSince) hostHalfOpenSince = now;
+          if (now - hostHalfOpenSince < 6000) return;
+          console.log('hostWatchdog: half-open timeout, forceConnect');
+          hostHalfOpenSince = 0;
+          try { forceConnectTo(roomHostId); } catch (e) {}
+          if (now - lastHostConnectStatusAt > 5000) {
+            lastHostConnectStatusAt = now;
+            setStatus('正在重新连接创建者…', 'warning');
+          }
+          hostConnectBackoffUntil = now + 3000;
           return;
         }
 
-        var now = Date.now();
+        hostHalfOpenSince = 0;
         if (now < hostConnectBackoffUntil) return;
 
         hostConnectFailStreak++;
-        var delay = Math.min(20000, 2000 * Math.pow(2, Math.min(hostConnectFailStreak - 1, 3)));
+        var delay = Math.min(12000, 1500 * Math.pow(1.6, Math.min(hostConnectFailStreak - 1, 4)));
         hostConnectBackoffUntil = now + delay;
 
-        console.log('hostWatchdog: forceConnect', roomHostId, 'streak', hostConnectFailStreak, 'next in', delay);
+        console.log('hostWatchdog: forceConnect', roomHostId, 'streak', hostConnectFailStreak);
         try { forceConnectTo(roomHostId); } catch (e) {}
 
-        // 状态提示节流，避免刷屏
-        if (now - lastHostConnectStatusAt > 8000) {
+        if (now - lastHostConnectStatusAt > 5000) {
           lastHostConnectStatusAt = now;
-          setStatus('网络不稳，稍后重试连接创建者（' + Math.round(delay / 1000) + 's）…', 'warning');
+          setStatus('正在连接创建者（约 ' + Math.round(delay / 1000) + 's 后可再试）…', 'warning');
         }
       }
 
-      setTimeout(tick, 800);
-      hostWatchdogTimer = setInterval(tick, 3000);
+      setTimeout(tick, 500);
+      hostWatchdogTimer = setInterval(tick, 2000);
     }
 
 function attemptRejoinRoom() {
