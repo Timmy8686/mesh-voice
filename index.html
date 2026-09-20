@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.3.4（最多4人）</title>
+  <title>Mesh 多人语音 v2.3.5（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.3.4 · 最多 4 人 · 创建者重连状态修复 · 聊天与文档</p>
+  <p class="subtitle">v2.3.5 · 最多 4 人 · 掉线回登录 + 离开回填房间号</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -492,7 +492,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.3.4';
+    var APP_VERSION = '2.3.5';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -2226,7 +2226,7 @@ function onMediaConn(conn) {
         onDataConn(conn);
       });
 
-      // 与信令服务器断开：优先 peer.reconnect()，失败则整房重入
+      // 与信令服务器断开：优先 peer.reconnect()，超时仍断开则回到登录页
       p.on('disconnected', function() {
         if (intentionalLeave) return;
         console.warn('Peer 信令断开，尝试恢复');
@@ -2235,35 +2235,38 @@ function onMediaConn(conn) {
         try {
           if (typeof p.reconnect === 'function') {
             p.reconnect();
-            // 给 reconnect 几秒时间，避免立刻整房重建
+            // 给 reconnect 几秒时间；仍断开则退出到登录页并回填房间号
             if (!softDisconnectTimer) {
               softDisconnectTimer = setTimeout(function() {
                 softDisconnectTimer = null;
                 if (intentionalLeave) return;
                 if (peer && peer.disconnected) {
-                  scheduleReconnect('signaling-disconnected');
+                  console.warn('信令重连失败，回到登录界面');
+                  returnToLoginWithRoomFilled('signaling-disconnected-timeout');
                 }
-              }, 6000);
+              }, 8000);
             }
             return;
           }
         } catch (e) {
           console.warn('peer.reconnect failed', e);
         }
-        scheduleReconnect('signaling-disconnected');
+        // 无 reconnect 能力时直接回登录
+        returnToLoginWithRoomFilled('signaling-disconnected-no-reconnect');
       });
 
       p.on('close', function() {
         if (intentionalLeave) return;
-        console.warn('Peer close event — 延迟确认，避免误闪退');
-        // PeerJS 可能误报 close；2.5s 后若 peer 仍不可用再回登录
+        console.warn('Peer close event — 延迟确认后回登录');
+        // PeerJS 可能误报 close；2s 后若 peer 仍不可用则回到登录页并回填房间号
         setTimeout(function() {
           if (intentionalLeave) return;
-          if (peer && !peer.destroyed && peer.open) return;
-          if (peer && peer.id && !peer.disconnected && peer.open !== false) return;
+          // 只要 peer 已 destroyed / 不存在 / 明确未 open，就回登录
+          var stillAlive = peer && !peer.destroyed && (peer.open === true);
+          if (stillAlive) return;
           console.warn('Peer 确认已失效，回登录');
           returnToLoginWithRoomFilled('peer-close-confirmed');
-        }, 2500);
+        }, 2000);
       });
 
       p.on('error', function(err) {
@@ -2292,10 +2295,25 @@ function onMediaConn(conn) {
         window.__meshWasHost = !!isHost || (myId && roomHostId && myId === roomHostId);
         window.__meshLastMyId = myId || window.__meshLastMyId || '';
       } catch (e) {}
-      var rid = roomHostId;
+
+      // 多来源抓取房间号，防止掉线过程中 roomHostId 已被清空
+      var rid = roomHostId || '';
       try {
-        var saved = loadActiveRoom && loadActiveRoom();
-        if (!rid && saved && saved.roomHostId) rid = saved.roomHostId;
+        if (!rid || rid === '-') {
+          var dispEl = document.getElementById('roomIdDisplay');
+          if (dispEl && dispEl.textContent && dispEl.textContent !== '-') {
+            rid = dispEl.textContent.trim();
+          }
+        }
+        if (!rid) rid = window.__meshLastRoom || '';
+        if (!rid) {
+          var saved = loadActiveRoom && loadActiveRoom();
+          if (saved && saved.roomHostId) rid = saved.roomHostId;
+        }
+        if (!rid) {
+          try { rid = localStorage.getItem('mesh4_last_host_id') || ''; } catch (e2) {}
+        }
+        if (rid) window.__meshLastRoom = rid;
       } catch (e) {}
 
       intentionalLeave = true;
@@ -2862,9 +2880,16 @@ function attemptRejoinRoom() {
       if (destroyRoomId === undefined) destroyRoomId = true;
       stopHostWatchdog();
 
-      // 离开前记住房间号，回到登录页自动填入
+      // 离开前先把房间号抓到本地变量，避免后续 clear 后丢失
+      var keepRoom = '';
       try {
-        window.__meshLastRoom = roomHostId || (document.getElementById('hostIdInput') || {}).value || '';
+        keepRoom = roomHostId ||
+          (document.getElementById('roomIdDisplay') || {}).textContent ||
+          (document.getElementById('hostIdInput') || {}).value ||
+          window.__meshLastRoom ||
+          '';
+        if (keepRoom === '-') keepRoom = '';
+        window.__meshLastRoom = keepRoom;
         window.__meshWasHost = !!isHost || (myId && roomHostId && myId === roomHostId);
         window.__meshLastMyId = myId || window.__meshLastMyId || '';
       } catch (e) {}
@@ -2931,16 +2956,15 @@ function attemptRejoinRoom() {
       if (!fromUnload) {
         audioContainer.innerHTML = '';
         showSection('initSection');
-        var keepRoom = roomHostId;
-        if (typeof window.__meshLastRoom === 'string' && window.__meshLastRoom) {
-          keepRoom = window.__meshLastRoom;
-        }
+        // 用离开前捕获的房间号回填，保证手动离开也能填回
         if (keepRoom) {
           document.getElementById('hostIdInput').value = keepRoom;
           var box = document.getElementById('createdRoomBox');
           var disp = document.getElementById('createdRoomIdDisplay');
           if (disp) disp.textContent = keepRoom;
           if (box) box.style.display = 'block';
+          // 保留引用，方便再次进入
+          roomHostId = keepRoom;
           setStatus('已离开，房间号已填入，可再次点「进入房间」');
         } else {
           document.getElementById('hostIdInput').value = '';
