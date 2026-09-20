@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.3.7（最多4人）</title>
+  <title>Mesh 多人语音 v2.3.8（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.3.7 · 最多 4 人 · 房主迁移 + 无主互连</p>
+  <p class="subtitle">v2.3.8 · 最多 4 人 · 限制 PeerConnection 防爆</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -492,7 +492,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.3.7';
+    var APP_VERSION = '2.3.8';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -515,6 +515,12 @@
     var electionInProgress = false;
     var roomNodeEpoch = 0;           // 房间节点世代，防旧节点干扰
     var isMigratingRoomNode = false;  // 正在接管房间节点，避免 close 误回登录
+    var pendingConnect = {};          // remoteId -> timestamp，防止重复建连
+    var lastConnectAt = {};            // remoteId -> 上次发起连接时间
+    var lastMeshAllAt = 0;             // meshConnectAll 节流
+    var CONNECT_COOLDOWN_MS = 4000;    // 同一对象最短重连间隔
+    var MESH_ALL_COOLDOWN_MS = 3000;   // 全员 mesh 最短间隔
+    var MAX_PC_SOFT = 12;              // 本页软上限（媒体+数据），超则停止新建
 
     var statusEl = document.getElementById('status');
     var peersListEl = document.getElementById('peersList');
@@ -2063,9 +2069,15 @@ function onMediaConn(conn) {
       }
     }
 
-    function forceConnectTo(remoteId) {
-      if (!remoteId || remoteId === myId || !peer) return;
-      // 清掉失效连接，允许重新 call/connect
+    function countOpenPeerConnections() {
+      var n = 0;
+      var k;
+      for (k in mediaConns) if (mediaConns.hasOwnProperty(k) && mediaConns[k]) n++;
+      for (k in dataConns) if (dataConns.hasOwnProperty(k) && dataConns[k]) n++;
+      return n;
+    }
+
+    function closeDeadConn(remoteId) {
       if (mediaConns[remoteId] && !isPeerConnAlive(mediaConns[remoteId])) {
         try { mediaConns[remoteId].close(); } catch (e) {}
         delete mediaConns[remoteId];
@@ -2074,12 +2086,38 @@ function onMediaConn(conn) {
         try { dataConns[remoteId].close(); } catch (e) {}
         delete dataConns[remoteId];
       }
-      connectTo(remoteId, true);
+    }
+
+    function forceConnectTo(remoteId) {
+      if (!remoteId || remoteId === myId || !peer) return;
+      closeDeadConn(remoteId);
+      // 存活则不强制重建，避免 PeerConnection 爆炸
+      if (isPeerConnAlive(mediaConns[remoteId]) && isPeerConnAlive(dataConns[remoteId])) return;
+      connectTo(remoteId, false);
     }
 
     function connectTo(remoteId, force) {
       if (!remoteId || remoteId === myId) return;
-      if (!force && mediaConns[remoteId] && isPeerConnAlive(mediaConns[remoteId])) return;
+      if (!peer || intentionalLeave) return;
+
+      var now = Date.now();
+      // 冷却：同一目标短时间不重复发起
+      if (!force && lastConnectAt[remoteId] && (now - lastConnectAt[remoteId] < CONNECT_COOLDOWN_MS)) {
+        return;
+      }
+      if (pendingConnect[remoteId] && (now - pendingConnect[remoteId] < CONNECT_COOLDOWN_MS)) {
+        return;
+      }
+
+      if (mediaConns[remoteId] && isPeerConnAlive(mediaConns[remoteId]) &&
+          dataConns[remoteId] && isPeerConnAlive(dataConns[remoteId])) {
+        return;
+      }
+
+      // 媒体已存活则只补数据通道，避免重复 peer.call
+      var needMedia = !(mediaConns[remoteId] && isPeerConnAlive(mediaConns[remoteId]));
+      var needData = !(dataConns[remoteId] && isPeerConnAlive(dataConns[remoteId]));
+
       if (force) {
         if (mediaConns[remoteId]) {
           try { mediaConns[remoteId].close(); } catch (e) {}
@@ -2089,37 +2127,70 @@ function onMediaConn(conn) {
           try { dataConns[remoteId].close(); } catch (e) {}
           delete dataConns[remoteId];
         }
-      } else if (mediaConns[remoteId]) {
-        return;
+        needMedia = true;
+        needData = true;
+      } else {
+        closeDeadConn(remoteId);
+        needMedia = !(mediaConns[remoteId] && isPeerConnAlive(mediaConns[remoteId]));
+        needData = !(dataConns[remoteId] && isPeerConnAlive(dataConns[remoteId]));
       }
+
+      if (!needMedia && !needData) return;
+
       if (memberCount() >= MAX_PEERS && !members[remoteId]) {
         setStatus('房间已满（最多4人）', 'warning');
         return;
       }
-      if (!peer) {
-        return;
+
+      // 软上限：连接对象过多时先清理死亡连接再评估
+      if (countOpenPeerConnections() >= MAX_PC_SOFT) {
+        for (var dk in mediaConns) {
+          if (mediaConns.hasOwnProperty(dk)) closeDeadConn(dk);
+        }
+        if (countOpenPeerConnections() >= MAX_PC_SOFT) {
+          console.warn('PeerConnection 数量接近上限，跳过连接', remoteId);
+          setStatus('连接过多，稍候自动恢复…', 'warning');
+          return;
+        }
       }
 
-      // 不在呼叫阶段写入 members，避免未连通的幽灵 ID 出现在列表
       rosterAdd(remoteId);
+      pendingConnect[remoteId] = now;
+      lastConnectAt[remoteId] = now;
 
       getMic().then(function(stream) {
-        if (!peer || intentionalLeave) return;
-        try {
-          var call = peer.call(remoteId, stream);
-          if (call) onMediaConn(call);
-        } catch (e) {
-          console.warn('peer.call failed', remoteId, e);
+        if (!peer || intentionalLeave) {
+          delete pendingConnect[remoteId];
+          return;
         }
         try {
-          var dconn = peer.connect(remoteId, { reliable: true });
-          if (dconn) onDataConn(dconn);
+          if (needMedia) {
+            var call = peer.call(remoteId, stream);
+            if (call) onMediaConn(call);
+          }
+        } catch (e) {
+          console.warn('peer.call failed', remoteId, e);
+          var msg = (e && e.message) ? e.message : String(e);
+          if (msg.indexOf('so many PeerConnections') !== -1 || msg.indexOf('PeerConnection') !== -1) {
+            setStatus('连接数过多，正在清理后重试…', 'warning');
+            // 清理所有非存活连接
+            for (var ck in mediaConns) {
+              if (mediaConns.hasOwnProperty(ck)) closeDeadConn(ck);
+            }
+          }
+        }
+        try {
+          if (needData) {
+            var dconn = peer.connect(remoteId, { reliable: true });
+            if (dconn) onDataConn(dconn);
+          }
         } catch (e2) {
           console.warn('peer.connect failed', remoteId, e2);
         }
-        // 仅保存名单，列表等 stream/data open 后再显示
         try { saveActiveRoom(); } catch (e3) {}
+        setTimeout(function() { delete pendingConnect[remoteId]; }, CONNECT_COOLDOWN_MS);
       }).catch(function(e) {
+        delete pendingConnect[remoteId];
         console.warn('connectTo getMic failed', remoteId, e);
       });
     }
@@ -2268,13 +2339,33 @@ function onMediaConn(conn) {
     function bindPeerRoomEvents(p) {
       p.on('call', function(call) {
         if (memberCount() >= MAX_PEERS) {
-          call.close();
+          try { call.close(); } catch (e) {}
+          return;
+        }
+        // 已有与该对端的存活媒体连接则拒掉重复呼叫，避免双倍 PC
+        var rid = call.peer;
+        if (rid && mediaConns[rid] && isPeerConnAlive(mediaConns[rid])) {
+          try { call.close(); } catch (e) {}
           return;
         }
         getMic().then(function(stream) {
-          call.answer(stream);
-          onMediaConn(call);
-          if (!isReconnecting) setStatus('有人加入', 'connected');
+          try {
+            call.answer(stream);
+            onMediaConn(call);
+            if (!isReconnecting) setStatus('有人加入', 'connected');
+          } catch (err) {
+            var msg = (err && err.message) ? err.message : String(err);
+            console.warn('call.answer failed', msg);
+            if (msg.indexOf('so many PeerConnections') !== -1) {
+              for (var ck in mediaConns) {
+                if (mediaConns.hasOwnProperty(ck)) closeDeadConn(ck);
+              }
+              setStatus('连接数过多，已清理无效连接，请对方重新进入', 'warning');
+            } else {
+              setStatus('接听失败: ' + msg, 'error');
+            }
+            try { call.close(); } catch (e2) {}
+          }
         }).catch(function(e) {
           setStatus('接听失败: ' + (e.message || e), 'error');
         });
@@ -2955,9 +3046,13 @@ function attemptRejoinRoom() {
     }
 
 
-    /** 全员 Mesh：向名单中所有其他成员建立连接 */
+    /** 全员 Mesh：向名单中所有其他成员建立连接（带节流，防止 PeerConnection 爆炸） */
     function meshConnectAll() {
       if (!peer || intentionalLeave) return;
+      var now = Date.now();
+      if (now - lastMeshAllAt < MESH_ALL_COOLDOWN_MS) return;
+      lastMeshAllAt = now;
+
       var targets = {};
       if (roomHostId && roomHostId !== myId) targets[roomHostId] = true;
       for (var i = 0; i < roomRoster.length; i++) {
@@ -2966,12 +3061,15 @@ function attemptRejoinRoom() {
       for (var k in members) {
         if (members.hasOwnProperty(k) && k !== myId) targets[k] = true;
       }
-      for (var id in targets) {
-        if (!targets.hasOwnProperty(id)) continue;
-        if (!isPeerConnAlive(mediaConns[id]) || !isPeerConnAlive(dataConns[id])) {
-          try { forceConnectTo(id); } catch (e) {}
-        }
-      }
+      var ids = Object.keys(targets);
+      // 逐个错峰连接，避免同一时刻创建过多 RTCPeerConnection
+      ids.forEach(function(id, idx) {
+        setTimeout(function() {
+          if (intentionalLeave || !peer) return;
+          if (isPeerConnAlive(mediaConns[id]) && isPeerConnAlive(dataConns[id])) return;
+          try { connectTo(id, false); } catch (e) {}
+        }, idx * 350);
+      });
     }
 
     function stopElection() {
