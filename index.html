@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.3.6（最多4人）</title>
+  <title>Mesh 多人语音 v2.3.7（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.3.6 · 最多 4 人 · 幽灵成员修复 + 文件上限200MB</p>
+  <p class="subtitle">v2.3.7 · 最多 4 人 · 房主迁移 + 无主互连</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -492,7 +492,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.3.6';
+    var APP_VERSION = '2.3.7';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -510,6 +510,11 @@
     var RECONNECT_BASE_MS = 1500;
     var ROOM_LS_KEY = 'mesh4_active_room';
     var roomRoster = []; // 本房间已知成员 Peer ID，重连时全员互连
+    var isRoomNode = false;          // 当前是否占用房间号（房间节点，可迁移）
+    var electionTimer = null;
+    var electionInProgress = false;
+    var roomNodeEpoch = 0;           // 房间节点世代，防旧节点干扰
+    var isMigratingRoomNode = false;  // 正在接管房间节点，避免 close 误回登录
 
     var statusEl = document.getElementById('status');
     var peersListEl = document.getElementById('peersList');
@@ -1125,14 +1130,17 @@ function onMediaConn(conn) {
           members[rid].network = 'good';
           members[rid].confirmed = true;
         }
+        rosterAdd(rid);
         playRemoteStream(stream, rid);
         updateUI();
-        if (roomHostId && rid === roomHostId && !isHost) {
+        if (roomHostId && rid === roomHostId && !isRoomNode) {
           onHostLinked('media-stream');
-        } else if (!isHost && rid !== myId) {
+          stopElection(); // 已有节点，取消选举
+        } else if (rid !== myId) {
           setStatus('已与成员建立语音', 'connected');
         }
         try { broadcastSync(); } catch (e) {}
+        try { meshConnectAll(); } catch (e) {}
       });
 
       conn.on('close', function() {
@@ -1143,22 +1151,35 @@ function onMediaConn(conn) {
           try { a.srcObject = null; } catch (e) {}
           a.remove();
         }
-        // 若断开的是房间号（创建者），成员保留房间、稍后 watchdog 会再连
-        if (roomHostId && rid === roomHostId && !isHost && !intentionalLeave) {
+        // 房间节点离开：成员保留房间，Mesh 互连，并竞选新节点
+        if (roomHostId && rid === roomHostId && !isRoomNode && !intentionalLeave) {
           if (members[rid]) members[rid].network = 'poor';
+          delete members[rid];
           updateUI();
           onHostUnlinked('media-close');
-          setStatus('创建者暂时离开，正在尝试重连…', 'warning');
+          setStatus('房间节点已离开，成员保持互连并选举新节点…', 'warning');
           hostConnectFailStreak = 0;
           hostConnectBackoffUntil = 0;
+          try { meshConnectAll(); } catch (e) {}
           setTimeout(function() {
-            if (!intentionalLeave && peer && !isHost) forceConnectTo(roomHostId);
-          }, 1200);
+            if (!intentionalLeave && peer && !isRoomNode) {
+              // 先尝试重连原房间号；若无人占用则启动选举
+              forceConnectTo(roomHostId);
+              setTimeout(function() {
+                if (!intentionalLeave && !isRoomNode &&
+                    !isPeerConnAlive(mediaConns[roomHostId]) &&
+                    !isPeerConnAlive(dataConns[roomHostId])) {
+                  startRoomNodeElection('media-close');
+                }
+              }, 2500);
+            }
+          }, 800);
           return;
         }
         delete members[rid];
         updateUI();
         setStatus('有人离开', 'warning');
+        try { meshConnectAll(); } catch (e) {}
       });
 
       conn.on('error', function(err) {
@@ -1899,7 +1920,6 @@ function onMediaConn(conn) {
         if (!data || typeof data !== 'object') return;
 
         if (data.type === 'sync' && data.members) {
-          // 只连真实在线提示的 ID，不把未接通的人先画进列表
           for (var i = 0; i < data.members.length; i++) {
             var id = data.members[i];
             if (!id || id === myId) continue;
@@ -1909,10 +1929,32 @@ function onMediaConn(conn) {
             }
           }
           saveActiveRoom();
+          try { meshConnectAll(); } catch (e) {}
+        }
+
+        // 新房间节点广播：停止选举，连向新节点并全员 Mesh
+        if (data.type === 'room-node' && data.roomId && data.nodeId) {
+          if (data.roomId === roomHostId && data.nodeId !== myId) {
+            stopElection();
+            rosterAdd(data.nodeId);
+            setStatus('新房间节点已上线，正在连接…', 'connected');
+            try { forceConnectTo(data.nodeId); } catch (e) {}
+            if (data.nodeId === roomHostId || data.nodeId) {
+              try { forceConnectTo(roomHostId); } catch (e2) {}
+            }
+            try { meshConnectAll(); } catch (e3) {}
+          }
+        }
+
+        // 原节点主动离开通知
+        if (data.type === 'node-left' && data.roomId === roomHostId && !isRoomNode && !intentionalLeave) {
+          setStatus('房间节点已离开，保持互连并选举新节点…', 'warning');
+          try { meshConnectAll(); } catch (e) {}
+          startRoomNodeElection('node-left-msg');
         }
 
         if (data.type === 'status') {
-          if (!members[rid]) return; // 未确认成员不展示状态
+          if (!members[rid]) return;
           if (typeof data.muted === 'boolean') members[rid].muted = data.muted;
           if (typeof data.speaking === 'boolean' && !volumeMonitors[rid]) {
             members[rid].speaking = data.speaking;
@@ -1932,12 +1974,15 @@ function onMediaConn(conn) {
           members[rid].confirmed = true;
           members[rid].network = members[rid].network || 'good';
         }
+        rosterAdd(rid);
         updateUI();
-        if (roomHostId && rid === roomHostId && !isHost) {
+        if (roomHostId && rid === roomHostId && !isRoomNode) {
           onHostLinked('data-open');
+          stopElection();
         }
         sendSync(conn);
         sendStatus(conn);
+        try { meshConnectAll(); } catch (e) {}
       });
 
       conn.on('close', function() {
@@ -2241,7 +2286,7 @@ function onMediaConn(conn) {
 
       // 与信令服务器断开：优先 peer.reconnect()，超时仍断开则回到登录页
       p.on('disconnected', function() {
-        if (intentionalLeave) return;
+        if (intentionalLeave || isMigratingRoomNode) return;
         console.warn('Peer 信令断开，尝试恢复');
         setStatus('信令中断，尝试保活…', 'warning');
         setNetworkQuality('poor');
@@ -2269,11 +2314,10 @@ function onMediaConn(conn) {
       });
 
       p.on('close', function() {
-        if (intentionalLeave) return;
+        if (intentionalLeave || isMigratingRoomNode) return;
         console.warn('Peer close event — 延迟确认后回登录');
-        // PeerJS 可能误报 close；2s 后若 peer 仍不可用则回到登录页并回填房间号
         setTimeout(function() {
-          if (intentionalLeave) return;
+          if (intentionalLeave || isMigratingRoomNode) return;
           // 只要 peer 已 destroyed / 不存在 / 明确未 open，就回登录
           var stillAlive = peer && !peer.destroyed && (peer.open === true);
           if (stillAlive) return;
@@ -2409,7 +2453,8 @@ function onMediaConn(conn) {
 
     /** 成员已与创建者（房间号）连通：立刻更新状态，去掉「稍后重试」残留文案 */
     function onHostLinked(reason) {
-      if (isHost || !roomHostId) return;
+      if (isRoomNode || !roomHostId) return;
+      stopElection();
       hostConnectFailStreak = 0;
       hostConnectBackoffUntil = 0;
       hostHalfOpenSince = 0;
@@ -2436,10 +2481,10 @@ function onMediaConn(conn) {
      */
     function startHostWatchdog() {
       stopHostWatchdog();
-      if (isHost) return;
+      if (isRoomNode) return;
 
       function tick() {
-        if (intentionalLeave || !peer || !roomHostId || isHost) return;
+        if (intentionalLeave || !peer || !roomHostId || isRoomNode) return;
         try { pruneGhostMembers(); } catch (e) {}
 
         var m = mediaConns[roomHostId];
@@ -2478,10 +2523,16 @@ function onMediaConn(conn) {
 
         console.log('hostWatchdog: forceConnect', roomHostId, 'streak', hostConnectFailStreak);
         try { forceConnectTo(roomHostId); } catch (e) {}
+        try { meshConnectAll(); } catch (e2) {}
+
+        // 多次连不上房间节点 → 发起选举，由剩余成员接管
+        if (hostConnectFailStreak >= 3) {
+          startRoomNodeElection('watchdog-streak');
+        }
 
         if (now - lastHostConnectStatusAt > 5000) {
           lastHostConnectStatusAt = now;
-          setStatus('正在连接创建者（约 ' + Math.round(delay / 1000) + 's 后可再试）…', 'warning');
+          setStatus('正在连接房间节点（约 ' + Math.round(delay / 1000) + 's 后可再试）…', 'warning');
         }
       }
 
@@ -2687,8 +2738,10 @@ function attemptRejoinRoom() {
       }
       myId = null;
       isHost = false;
+      isRoomNode = false;
       intentionalLeave = false;
       isReconnecting = false;
+      stopElection();
       clearReconnectTimer();
       stopHostWatchdog();
       if (softDisconnectTimer) {
@@ -2709,11 +2762,22 @@ function attemptRejoinRoom() {
 
       getMic().then(function(stream) {
         if (asOwner) {
-          // ---------- 创建者：占用房间号 ----------
+          // ---------- 创建者：优先占用房间号；若已被新节点占用则降级为成员 ----------
           setStatus('创建者进入：占用房间号 ' + roomId + ' …');
-          return claimRoomIdAsHost(roomId, 12).then(function(p) {
+          return claimRoomIdAsHost(roomId, 6).then(function(p) {
             startVolumeMonitor(roomId, stream, true);
             return { p: p, asHost: true };
+          }).catch(function() {
+            setStatus('房间号已被其他节点占用，以成员身份加入…', 'warning');
+            var memberId = getStableMemberId(roomId);
+            startVolumeMonitor(memberId, stream, true);
+            return createPeerWithRetry(memberId, 0, true).then(function(p) {
+              if (p.id === roomId) {
+                try { p.destroy(); } catch (e) {}
+                throw new Error('成员误占用了房间号');
+              }
+              return { p: p, asHost: false };
+            });
           });
         }
 
@@ -2741,7 +2805,9 @@ function attemptRejoinRoom() {
         peer = result.p;
         myId = peer.id;
         isHost = !!result.asHost;
+        isRoomNode = !!result.asHost || (myId === roomId);
         roomHostId = roomId;
+        stopElection();
 
         // 二次保险：非创建者若 ID 等于房间号，立即销毁并失败
         if (!asOwner && myId === roomId) {
@@ -2776,19 +2842,30 @@ function attemptRejoinRoom() {
         destroyChatCompletely();
         showSection('roomSection');
         updateUI();
-        if (isHost) {
+        if (isRoomNode) {
           stopHostWatchdog();
-          setStatus('已进入（创建者）。等待成员连接；成员端会自动连回本房间号', 'connected');
+          setStatus('已进入（房间节点）。等待成员连接；支持全员互连', 'connected');
         } else {
           startHostWatchdog();
-          setStatus('已进入（成员）。将自动尝试连接创建者房间号', 'connected');
+          setStatus('已进入（成员）。连接房间节点并与其他成员互连', 'connected');
+          setTimeout(function() { try { meshConnectAll(); } catch (e) {} }, 1500);
         }
 
         setTimeout(function() {
-          if (!intentionalLeave && peer && !isHost) {
+          if (!intentionalLeave && peer && !isRoomNode) {
             connectTo(roomId);
+            try { meshConnectAll(); } catch (e) {}
           }
         }, 2000);
+        // 若进入后一段时间仍无房间节点，成员可竞选接管，使空房也能被新成员加入
+        setTimeout(function() {
+          if (!intentionalLeave && peer && !isRoomNode && roomHostId) {
+            var hasNode = isPeerConnAlive(mediaConns[roomHostId]) || isPeerConnAlive(dataConns[roomHostId]);
+            if (!hasNode) {
+              startRoomNodeElection('join-no-node');
+            }
+          }
+        }, 6000);
       }).catch(function(err) {
         setStatus('进入房间失败: ' + (err.message || err.type || err), 'error');
         console.error(err);
@@ -2877,6 +2954,184 @@ function attemptRejoinRoom() {
       saveActiveRoom();
     }
 
+
+    /** 全员 Mesh：向名单中所有其他成员建立连接 */
+    function meshConnectAll() {
+      if (!peer || intentionalLeave) return;
+      var targets = {};
+      if (roomHostId && roomHostId !== myId) targets[roomHostId] = true;
+      for (var i = 0; i < roomRoster.length; i++) {
+        if (roomRoster[i] && roomRoster[i] !== myId) targets[roomRoster[i]] = true;
+      }
+      for (var k in members) {
+        if (members.hasOwnProperty(k) && k !== myId) targets[k] = true;
+      }
+      for (var id in targets) {
+        if (!targets.hasOwnProperty(id)) continue;
+        if (!isPeerConnAlive(mediaConns[id]) || !isPeerConnAlive(dataConns[id])) {
+          try { forceConnectTo(id); } catch (e) {}
+        }
+      }
+    }
+
+    function stopElection() {
+      if (electionTimer) {
+        clearTimeout(electionTimer);
+        electionTimer = null;
+      }
+      electionInProgress = false;
+    }
+
+    /**
+     * 房间节点（占用房间号的人）离开后，剩余成员竞选新节点。
+     * 胜出者销毁当前 Peer，改用房间号作为 Peer ID，使新成员仍能通过房间号加入。
+     */
+    function startRoomNodeElection(reason) {
+      if (intentionalLeave || !roomHostId || !peer) return;
+      if (isRoomNode || myId === roomHostId) return; // 自己已是节点
+      if (electionInProgress) return;
+      electionInProgress = true;
+      // 按 ID 稳定排序产生延迟，降低多人同时抢号冲突
+      var delay = 800;
+      try {
+        var h = 0;
+        var s = String(myId || '');
+        for (var i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+        delay = 600 + (Math.abs(h) % 2000);
+      } catch (e) {}
+      console.log('startRoomNodeElection', reason, 'delay', delay);
+      setStatus('房间节点已离开，正在选举新节点…', 'warning');
+      stopElection();
+      electionTimer = setTimeout(function() {
+        electionTimer = null;
+        if (intentionalLeave || !roomHostId) { electionInProgress = false; return; }
+        // 若期间已有人占用房间号并连上，则取消
+        if (isPeerConnAlive(mediaConns[roomHostId]) || isPeerConnAlive(dataConns[roomHostId])) {
+          electionInProgress = false;
+          setStatus('已连上新的房间节点', 'connected');
+          meshConnectAll();
+          return;
+        }
+        tryBecomeRoomNode(reason);
+      }, delay);
+    }
+
+    function tryBecomeRoomNode(reason) {
+      if (intentionalLeave || !roomHostId || isRoomNode) {
+        electionInProgress = false;
+        return;
+      }
+      isMigratingRoomNode = true;
+      // 保存需重连的成员名单
+      var savedRoster = [];
+      for (var k in members) {
+        if (members.hasOwnProperty(k) && k !== myId) savedRoster.push(k);
+      }
+      for (var i = 0; i < roomRoster.length; i++) {
+        if (roomRoster[i] && roomRoster[i] !== myId && savedRoster.indexOf(roomRoster[i]) === -1) {
+          savedRoster.push(roomRoster[i]);
+        }
+      }
+      var prevId = myId;
+      setStatus('正在接管房间节点…', 'warning');
+      console.log('tryBecomeRoomNode', reason, 'from', prevId);
+
+      // 拆掉旧 peer，改用房间号
+      try {
+        for (var ck in mediaConns) { try { mediaConns[ck].close(); } catch (e) {} }
+        for (var ck2 in dataConns) { try { dataConns[ck2].close(); } catch (e) {} }
+      } catch (e) {}
+      mediaConns = {};
+      dataConns = {};
+      if (peer) {
+        try { peer.destroy(); } catch (e) {}
+        peer = null;
+      }
+
+      // 短暂等待信令释放旧 ID 后占用房间号
+      setTimeout(function() {
+        if (intentionalLeave) { electionInProgress = false; return; }
+        claimRoomIdAsHost(roomHostId, 8).then(function(p) {
+          peer = p;
+          myId = p.id;
+          isRoomNode = true;
+          isHost = true;
+          isMigratingRoomNode = false;
+          roomNodeEpoch++;
+          members = {};
+          ensureMember(myId);
+          members[myId].confirmed = true;
+          members[myId].network = 'good';
+          bindPeerRoomEvents(p);
+          document.getElementById('myIdDisplay').textContent = myId + '（房间节点）';
+          saveActiveRoom();
+          electionInProgress = false;
+          setStatus('已接管房间节点，正在恢复成员连接…', 'connected');
+          // 广播新节点身份，并 Mesh 回所有旧成员
+          setTimeout(function() {
+            for (var j = 0; j < savedRoster.length; j++) {
+              rosterAdd(savedRoster[j]);
+              try { forceConnectTo(savedRoster[j]); } catch (e) {}
+            }
+            try {
+              broadcastData({
+                type: 'room-node',
+                roomId: roomHostId,
+                nodeId: myId,
+                epoch: roomNodeEpoch,
+                from: myId,
+                ts: Date.now()
+              });
+              broadcastSync();
+            } catch (e) {}
+            meshConnectAll();
+          }, 400);
+          setTimeout(meshConnectAll, 2000);
+          setTimeout(meshConnectAll, 5000);
+        }).catch(function(err) {
+          console.warn('接管房间节点失败', err);
+          electionInProgress = false;
+          isMigratingRoomNode = false;
+          // 抢号失败：用回随机成员 ID 重新进房，继续等别人当节点
+          setStatus('接管失败，以成员身份重连…', 'warning');
+          var memberId = prevId && prevId !== roomHostId ? prevId : getStableMemberId(roomHostId);
+          createPeerWithRetry(memberId, 0, true).then(function(p2) {
+            if (p2.id === roomHostId) {
+              try { p2.destroy(); } catch (e) {}
+              throw new Error('member id conflict');
+            }
+            peer = p2;
+            myId = p2.id;
+            isRoomNode = false;
+            isHost = false;
+            members = {};
+            ensureMember(myId);
+            members[myId].confirmed = true;
+            bindPeerRoomEvents(p2);
+            document.getElementById('myIdDisplay').textContent = myId + '（成员）';
+            saveActiveRoom();
+            // 继续尝试连房间号 + mesh
+            connectTo(roomHostId);
+            for (var j = 0; j < savedRoster.length; j++) {
+              try { forceConnectTo(savedRoster[j]); } catch (e) {}
+            }
+            startHostWatchdog();
+            // 若仍无节点，稍后再次选举
+            setTimeout(function() {
+              if (!intentionalLeave && !isRoomNode &&
+                  !isPeerConnAlive(mediaConns[roomHostId]) &&
+                  !isPeerConnAlive(dataConns[roomHostId])) {
+                startRoomNodeElection('retry-after-fail');
+              }
+            }, 5000);
+          }).catch(function(e2) {
+            console.error('成员重连也失败', e2);
+            setStatus('重连失败，请手动重新进入房间', 'error');
+          });
+        });
+      }, 600);
+    }
+
     /** 清理幽灵成员：未确认的直接删；已确认但连接彻底 failed/closed 的也删 */
     function pruneGhostMembers() {
       var changed = false;
@@ -2957,8 +3212,22 @@ function attemptRejoinRoom() {
         window.__meshLastMyId = myId || window.__meshLastMyId || '';
       } catch (e) {}
 
+      // 房间节点离开时先通知其他人，便于立即选举（dissolve 除外）
+      try {
+        if (isRoomNode && roomHostId && !fromUnload) {
+          broadcastData({
+            type: 'node-left',
+            roomId: roomHostId,
+            from: myId,
+            ts: Date.now()
+          });
+        }
+      } catch (e) {}
+
       intentionalLeave = true;
       isReconnecting = false;
+      isRoomNode = false;
+      stopElection();
       clearReconnectTimer();
       reconnectAttempts = 0;
       stopHeartbeat();
