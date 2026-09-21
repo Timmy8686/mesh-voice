@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.3.11（最多4人）</title>
+  <title>Mesh 多人语音 v2.3.12（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.3.11 · 最多 4 人 · 重进房间立即恢复语音</p>
+  <p class="subtitle">v2.3.12 · 最多 4 人 · 按序竞选房间节点</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -492,7 +492,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.3.11';
+    var APP_VERSION = '2.3.12';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -515,6 +515,8 @@
     var electionInProgress = false;
     var roomNodeEpoch = 0;           // 房间节点世代，防旧节点干扰
     var isMigratingRoomNode = false;  // 正在接管房间节点，避免 close 误回登录
+    var myJoinOrder = 0;             // 本端进入本房间的顺序时间戳（越小越优先竞选）
+    var ELECTION_SLOT_MS = 3200;     // 每位候选人独占抢号时间窗，避免同时抢全军覆没
     var pendingConnect = {};          // remoteId -> timestamp，防止重复建连
     var lastConnectAt = {};            // remoteId -> 上次发起连接时间
     var lastMeshAllAt = 0;             // meshConnectAll 节流
@@ -2001,6 +2003,13 @@ function onMediaConn(conn) {
           try { meshConnectAll(); } catch (e) {}
         }
 
+        // 同步他人进房顺序，用于按序竞选
+        if (data.type === 'join-order' && data.from && data.joinOrder) {
+          ensureMember(data.from);
+          members[data.from].joinOrder = data.joinOrder;
+          rosterAdd(data.from);
+        }
+
         // 新房间节点广播：停止选举，连向新节点并全员 Mesh
         if (data.type === 'room-node' && data.roomId && data.nodeId) {
           if (data.roomId === roomHostId && data.nodeId !== myId) {
@@ -2027,6 +2036,9 @@ function onMediaConn(conn) {
           if (typeof data.muted === 'boolean') members[rid].muted = data.muted;
           if (typeof data.speaking === 'boolean' && !volumeMonitors[rid]) {
             members[rid].speaking = data.speaking;
+          }
+          if (typeof data.joinOrder === 'number' && data.joinOrder > 0) {
+            members[rid].joinOrder = data.joinOrder;
           }
           // 对方开始说话或取消静音时，确保本机扬声器在播
           if (data.speaking || data.muted === false) {
@@ -2089,7 +2101,8 @@ function onMediaConn(conn) {
           conn.send({
             type: 'status',
             muted: isMuted,
-            speaking: !!me.speaking
+            speaking: !!me.speaking,
+            joinOrder: myJoinOrder || 0
           });
         } catch (e) {
           console.warn('sendStatus failed', e);
@@ -2855,13 +2868,13 @@ function attemptRejoinRoom() {
      */
     /**
      * 占用房间号。
-     * - 若 ID 明确已被占用：立即失败（不再长时间等待释放）
-     * - 仅对超时/瞬时错误做极短重试
-     * retriesLeft 默认 2；单次超时 4s
+     * allowBusyRetry=false（进房）：ID 被占用立即失败，降级成员，不空等。
+     * allowBusyRetry=true（按序选举）：短重试，给上一任释放 / 上一候选人失败留时间。
      */
-    function claimRoomIdAsHost(roomId, retriesLeft, perTryMs) {
+    function claimRoomIdAsHost(roomId, retriesLeft, perTryMs, allowBusyRetry) {
       retriesLeft = retriesLeft === undefined ? 2 : retriesLeft;
       perTryMs = perTryMs || 4000;
+      allowBusyRetry = !!allowBusyRetry;
       return createPeerInstance(roomId, perTryMs).then(function(p) {
         if (p.id !== roomId) {
           try { p.destroy(); } catch (e) {}
@@ -2869,17 +2882,17 @@ function attemptRejoinRoom() {
         }
         return p;
       }).catch(function(err) {
-        // 已被占用：直接失败，由上层降级为成员，不空等释放
-        if (isPeerIdBusyError(err)) {
-          console.warn('房间号已被占用，停止等待', roomId, err);
+        var busy = isPeerIdBusyError(err);
+        if (busy && !allowBusyRetry) {
+          console.warn('房间号已被占用，停止等待', roomId);
           throw err;
         }
         if (retriesLeft <= 0) throw err;
-        setStatus('信令繁忙，快速重试占用（剩余 ' + retriesLeft + '）…', 'warning');
+        setStatus((busy ? '房间号暂忙，按序重试' : '信令繁忙，重试') + '（剩余 ' + retriesLeft + '）…', 'warning');
         return new Promise(function(resolve, reject) {
           setTimeout(function() {
-            claimRoomIdAsHost(roomId, retriesLeft - 1, perTryMs).then(resolve, reject);
-          }, 300);
+            claimRoomIdAsHost(roomId, retriesLeft - 1, perTryMs, allowBusyRetry).then(resolve, reject);
+          }, busy ? 700 : 300);
         });
       });
     }
@@ -2892,6 +2905,11 @@ function attemptRejoinRoom() {
       }
 
       var asOwner = isRoomOwner(roomId);
+      // 恢复本房间历史进房顺序（同一浏览器再次进入仍保持相对优先）
+      try {
+        var jo = parseInt(localStorage.getItem('mesh4_join_order_' + roomId) || '0', 10);
+        myJoinOrder = jo > 0 ? jo : 0;
+      } catch (e) { myJoinOrder = 0; }
 
       // 进房前彻底清空旧会话状态，防止多次建房/旧 ID 残留导致多出幽灵参与者
       try {
@@ -2996,9 +3014,19 @@ function attemptRejoinRoom() {
         // 只登记自己，不预载历史 roster，避免幽灵账号
         members = {};
         roomRoster = [];
+        // 进房顺序：越早进房竞选优先级越高；节点身份用房间号，顺序记 0
+        if (isRoomNode) {
+          myJoinOrder = 0;
+        } else if (!myJoinOrder) {
+          myJoinOrder = Date.now();
+        }
+        try {
+          localStorage.setItem('mesh4_join_order_' + roomId, String(myJoinOrder));
+        } catch (e) {}
         ensureMember(myId);
         members[myId].confirmed = true;
         members[myId].network = 'good';
+        members[myId].joinOrder = myJoinOrder;
         bindPeerRoomEvents(peer);
         resetRoomSessionFlags();
         try {
@@ -3173,45 +3201,95 @@ function attemptRejoinRoom() {
       });
     }
 
-    function stopElection() {
+    function clearElectionTimerOnly() {
       if (electionTimer) {
         clearTimeout(electionTimer);
         electionTimer = null;
       }
+    }
+
+    function stopElection() {
+      clearElectionTimerOnly();
       electionInProgress = false;
     }
 
+    /** 按进房顺序 + Peer ID 计算本端竞选名次（0=最先抢） */
+    function getElectionRank() {
+      var list = [];
+      function add(id, order) {
+        if (!id || id === roomHostId) return;
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].id === id) return;
+        }
+        list.push({ id: id, order: order || 0 });
+      }
+      add(myId, myJoinOrder || Date.now());
+      for (var k in members) {
+        if (!members.hasOwnProperty(k) || k === myId) continue;
+        add(k, (members[k] && members[k].joinOrder) || 0);
+      }
+      for (var r = 0; r < roomRoster.length; r++) {
+        add(roomRoster[r], 0);
+      }
+      list.sort(function(a, b) {
+        var ao = a.order || 0;
+        var bo = b.order || 0;
+        // 有有效 joinOrder 的优先；同为 0 时按 id 字典序（稳定）
+        if (ao > 0 && bo > 0 && ao !== bo) return ao - bo;
+        if (ao > 0 && bo <= 0) return -1;
+        if (bo > 0 && ao <= 0) return 1;
+        if (a.id < b.id) return -1;
+        if (a.id > b.id) return 1;
+        return 0;
+      });
+      for (var j = 0; j < list.length; j++) {
+        if (list[j].id === myId) return j;
+      }
+      return list.length;
+    }
+
     /**
-     * 房间节点（占用房间号的人）离开后，剩余成员竞选新节点。
-     * 胜出者销毁当前 Peer，改用房间号作为 Peer ID，使新成员仍能通过房间号加入。
+     * 房间节点离开后按「进房顺序」串行竞选，避免多人同时抢号全部失败。
+     * 第 N 名等待 N * ELECTION_SLOT_MS，期间若已有人连上房间号则放弃。
      */
     function startRoomNodeElection(reason) {
       if (intentionalLeave || !roomHostId || !peer) return;
-      if (isRoomNode || myId === roomHostId) return; // 自己已是节点
+      if (isRoomNode || myId === roomHostId) return;
       if (electionInProgress) return;
+
+      clearElectionTimerOnly();
       electionInProgress = true;
-      // 按 ID 稳定排序产生延迟，降低多人同时抢号冲突
-      var delay = 800;
+
+      var rank = getElectionRank();
+      var delay = rank * ELECTION_SLOT_MS + 200;
+      console.log('startRoomNodeElection', reason, 'rank', rank, 'delay', delay);
+      setStatus('房间节点已离开，按进房顺序竞选（本端第 ' + (rank + 1) + ' 顺位）…', 'warning');
+
+      // 广播自己的 joinOrder，便于他人计算名次
       try {
-        var h = 0;
-        var s = String(myId || '');
-        for (var i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
-        delay = 600 + (Math.abs(h) % 2000);
+        broadcastData({
+          type: 'join-order',
+          from: myId,
+          joinOrder: myJoinOrder || Date.now(),
+          roomId: roomHostId,
+          ts: Date.now()
+        });
       } catch (e) {}
-      console.log('startRoomNodeElection', reason, 'delay', delay);
-      setStatus('房间节点已离开，正在选举新节点…', 'warning');
-      stopElection();
+
       electionTimer = setTimeout(function() {
         electionTimer = null;
-        if (intentionalLeave || !roomHostId) { electionInProgress = false; return; }
-        // 若期间已有人占用房间号并连上，则取消
-        if (isPeerConnAlive(mediaConns[roomHostId]) || isPeerConnAlive(dataConns[roomHostId])) {
+        if (intentionalLeave || !roomHostId) {
           electionInProgress = false;
-          setStatus('已连上新的房间节点', 'connected');
-          meshConnectAll();
           return;
         }
-        tryBecomeRoomNode(reason);
+        // 已有人占用房间号并连通 → 本端不抢
+        if (isPeerConnAlive(mediaConns[roomHostId]) || isPeerConnAlive(dataConns[roomHostId])) {
+          electionInProgress = false;
+          setStatus('已连上房间节点', 'connected');
+          try { meshConnectAll(); } catch (e) {}
+          return;
+        }
+        tryBecomeRoomNode(reason + ':rank' + rank);
       }, delay);
     }
 
@@ -3250,7 +3328,7 @@ function attemptRejoinRoom() {
       // 短暂等待信令释放旧 ID 后占用房间号
       setTimeout(function() {
         if (intentionalLeave) { electionInProgress = false; return; }
-        claimRoomIdAsHost(roomHostId, 2, 4000).then(function(p) {
+        claimRoomIdAsHost(roomHostId, 3, 3500, true).then(function(p) {
           peer = p;
           myId = p.id;
           isRoomNode = true;
@@ -3322,7 +3400,7 @@ function attemptRejoinRoom() {
                   !isPeerConnAlive(dataConns[roomHostId])) {
                 startRoomNodeElection('retry-after-fail');
               }
-            }, 5000);
+            }, 4000 + getElectionRank() * ELECTION_SLOT_MS);
           }).catch(function(e2) {
             console.error('成员重连也失败', e2);
             setStatus('重连失败，请手动重新进入房间', 'error');
