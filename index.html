@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.5.4（最多4人）</title>
+  <title>Mesh 多人语音 v2.6.0（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.5.4 · 弱网保活 · 扬声器双通道 · 静音强同步</p>
+  <p class="subtitle">v2.6.0 · 弱网保活优先 · 进出不分先后 · 文件64k/2M/并行4</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -370,7 +370,7 @@
         <button class="btn-secondary" id="btnMute">静音</button>
         <button class="btn-danger" id="btnLeave">离开房间</button>
       </div>
-      <button class="btn-dissolve" id="btnDissolve">一键全部退出（销毁聊天）</button>
+      <button class="btn-dissolve" id="btnDissolve">一键清理（清除所有房间成员）</button>
       <p class="hint" id="countHint">当前 1 / 4 人</p>
 
       <!-- 文本聊天 + 文档（仅内存，退出即销毁） -->
@@ -480,9 +480,10 @@
     var SPEAKING_CHECK_INTERVAL = 80;   // ms，更快响应
 
     // 弱网优先：语音码率上限（bps），约 16~32kbps 对语音足够且更抗丢包
-    var AUDIO_BITRATE_GOOD = 32000;
-    var AUDIO_BITRATE_MID = 20000;
-    var AUDIO_BITRATE_POOR = 12000;
+    // 可牺牲音质：更低码率，弱网更不容易挂
+    var AUDIO_BITRATE_GOOD = 16000;
+    var AUDIO_BITRATE_MID = 12000;
+    var AUDIO_BITRATE_POOR = 8000;
     var AUDIO_MAX_BITRATE = AUDIO_BITRATE_MID;
 
     var peer = null;
@@ -515,18 +516,18 @@
     var chatMessages = [];           // { id, from, name, text?, fileName?, fileUrl?, fileSize?, ts, type }
     var chatFileUrls = [];           // 需 revoke 的 ObjectURL
     var MAX_FILE_BYTES = 200 * 1024 * 1024; // 200MB
-    // 弱网优先、尽量快：中等分片 + 中等并行，避免 256KB×8 易堵死
-    var FILE_CHUNK_SIZE = 128 * 1024;      // 128KB
-    var FILE_BUFFER_HIGH = 2.5 * 1024 * 1024; // ~2.5MB 背压
-    var FILE_PARALLEL = 5;                 // 并行窗口
-    var FILE_PARALLEL_MIN = 2;             // 弱网降级下限
+    // 用户指定：64KB 分片 / 2MB 缓冲 / 并行 4 / 进度实时
+    var FILE_CHUNK_SIZE = 64 * 1024;
+    var FILE_BUFFER_HIGH = 2 * 1024 * 1024;
+    var FILE_PARALLEL = 4;
+    var FILE_PARALLEL_MIN = 2;
     var fileTransferBusy = false;
     var outgoingFileQueue = [];
     var activeSendCancel = false;
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.5.4';
+    var APP_VERSION = '2.6.0';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -1685,8 +1686,7 @@ function onMediaConn(conn) {
 
       function updateProgress(sentCount, peerN) {
         var pct = Math.min(100, Math.round((sentCount / totalChunks) * 100));
-        // 每约 8% 或首尾刷新 UI，减轻主线程压力
-        if (pct < 100 && lastUiPct >= 0 && pct - lastUiPct < 8) return;
+        // 实时进度：每片都刷新
         lastUiPct = pct;
         updateChatMsgById(fileId, {
           fileStatus: '发送中 ' + pct + '%（' + sentCount + '/' + totalChunks + '）· 通道 ' + peerN,
@@ -2021,12 +2021,23 @@ function onMediaConn(conn) {
     }
 
     function dissolveRoomForAll() {
-      if (!peer) return;
-      if (!confirm('确定让所有人退出并销毁全部聊天记录与文件？')) return;
-      broadcastData({ type: 'dissolve', from: myId, ts: Date.now() });
+      if (!confirm('确定清除所有房间成员并销毁聊天记录？所有人将退出房间。')) return;
+      try {
+        broadcastData({ type: 'dissolve', from: myId, ts: Date.now() });
+      } catch (e) {}
+      // 再补发一次，提高弱网到达率
+      setTimeout(function() {
+        try { broadcastData({ type: 'dissolve', from: myId, ts: Date.now() }); } catch (e2) {}
+      }, 200);
       destroyChatCompletely();
-      leaveRoom(false, true); // 一键全部退出：销毁创建者房间 ID
-      setStatus('已解散房间，聊天记录已销毁', 'warning');
+      // 先切 UI
+      try {
+        showSection('initSection');
+        setStatus('已清理房间，所有成员应已退出', 'warning');
+      } catch (e3) {}
+      setTimeout(function() {
+        try { leaveRoom(false, true); } catch (e4) {}
+      }, 0);
     }
 
     function onDataConn(conn) {
@@ -3045,17 +3056,24 @@ function attemptRejoinRoom() {
         }
         if (isHost) {
           stopHostWatchdog();
-          setStatus('已进入（创建者）。等待成员连接；成员端会自动连回本房间号', 'connected');
+          setStatus('已进入（房主）。等待成员连接同一房间号', 'connected');
+          // 房主后到：定时向名单成员补连（进出不分先后）
+          setTimeout(function() { if (!intentionalLeave && peer) try { reconnectToRoomMesh(); } catch (e) {} }, 1000);
+          setTimeout(function() { if (!intentionalLeave && peer) try { reconnectToRoomMesh(); } catch (e) {} }, 4000);
+          setTimeout(function() { if (!intentionalLeave && peer) try { reconnectToRoomMesh(); } catch (e) {} }, 10000);
         } else {
           startHostWatchdog();
-          setStatus('已进入（成员）。将自动尝试连接创建者房间号', 'connected');
+          setStatus('已进入（成员）。正在连接房主…', 'connected');
         }
 
         setTimeout(function() {
-          if (!intentionalLeave && peer && !isHost) {
-            connectTo(roomId, true);
-            kickAllRemoteAudio();
+          if (intentionalLeave || !peer) return;
+          if (!isHost) {
+            if (!isPeerConnAlive(mediaConns[roomId])) {
+              try { connectTo(roomId, false); } catch (e) {}
+            }
           }
+          try { kickAllRemoteAudio(); } catch (e2) {}
         }, 2000);
       }).catch(function(err) {
         setStatus('进入房间失败: ' + (err.message || err.type || err), 'error');
