@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.5.1（最多4人）</title>
+  <title>Mesh 多人语音 v2.5.2（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.5.1 · 弱网双向建连 · 退出加速</p>
+  <p class="subtitle">v2.5.2 · 静音同步加固 · 文件传输加速</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -490,6 +490,8 @@
     var localStream = null;          // 原始麦克风流
     var processedStream = null;      // 经过噪声门 + 增益处理后的发送流
     var isMuted = false;
+    var statusSeq = 0;               // 静音状态序号，防乱序覆盖
+    var statusSyncTimer = null;
     var mediaConns = {};
     var dataConns = {};
     var pendingConnect = {};
@@ -511,16 +513,16 @@
     var chatMessages = [];           // { id, from, name, text?, fileName?, fileUrl?, fileSize?, ts, type }
     var chatFileUrls = [];           // 需 revoke 的 ObjectURL
     var MAX_FILE_BYTES = 200 * 1024 * 1024; // 200MB
-    var FILE_CHUNK_SIZE = 64 * 1024;      // 64KB：速度与稳定性折中
-    var FILE_BUFFER_HIGH = 1.5 * 1024 * 1024; // ~1.5MB 背压阈值
-    var FILE_PARALLEL = 3;                 // 同时在途分片数（小窗口并行）
+    var FILE_CHUNK_SIZE = 256 * 1024;     // 256KB：减少片数与往返
+    var FILE_BUFFER_HIGH = 4 * 1024 * 1024; // ~4MB 背压阈值（更大在途）
+    var FILE_PARALLEL = 8;                 // 同时在途分片数
     var fileTransferBusy = false;
     var outgoingFileQueue = [];
     var activeSendCancel = false;
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.5.1';
+    var APP_VERSION = '2.5.2';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -1460,7 +1462,7 @@ function onMediaConn(conn) {
     /** 背压：优先等 bufferedamountlow，避免盲等 */
     function waitConnDrain(conn, timeoutMs) {
       return new Promise(function(resolve) {
-        timeoutMs = timeoutMs || 4000;
+        timeoutMs = timeoutMs || 1200;
         if (!conn || !conn.open) return resolve(false);
         if (getConnBufferedAmount(conn) < FILE_BUFFER_HIGH) return resolve(true);
 
@@ -1504,7 +1506,7 @@ function onMediaConn(conn) {
         (function poll() {
           if (done) return;
           if (!conn.open || getConnBufferedAmount(conn) < FILE_BUFFER_HIGH) return finish();
-          setTimeout(poll, 25);
+          setTimeout(poll, 10);
         })();
       });
     }
@@ -1696,7 +1698,7 @@ function onMediaConn(conn) {
                 }
                 // 所有对端背压就绪后再发这一片
                 return Promise.all(peers.map(function(p) {
-                  return waitConnDrain(p.conn, 4000);
+                  return waitConnDrain(p.conn, 1200);
                 })).then(function() {
                   if (activeSendCancel) return;
                   peers = getOpenDataConnList();
@@ -1944,12 +1946,24 @@ function onMediaConn(conn) {
         }
 
         if (data.type === 'status') {
-          if (!members[rid]) return; // 未确认成员不展示状态
+          ensureMember(rid);
+          // 序号防乱序：只接受更新的状态
+          if (typeof data.seq === 'number') {
+            if (members[rid]._statusSeq != null && data.seq < members[rid]._statusSeq) {
+              return;
+            }
+            members[rid]._statusSeq = data.seq;
+          }
           if (typeof data.muted === 'boolean') members[rid].muted = data.muted;
           if (typeof data.speaking === 'boolean' && !volumeMonitors[rid]) {
             members[rid].speaking = data.speaking;
           }
+          members[rid].confirmed = true;
           updateUI();
+        }
+
+        if (data.type === 'status-request') {
+          try { sendStatus(conn); } catch (e) {}
         }
 
         if (data.type === 'chat' || data.type === 'file' || data.type === 'file-meta' ||
@@ -1971,6 +1985,7 @@ function onMediaConn(conn) {
         }
         sendSync(conn);
         sendStatus(conn);
+        try { conn.send({ type: 'status-request', from: myId, ts: Date.now() }); } catch (e) {}
         // 数据通道通了也补媒体，避免只有名单没有声音
         if (rid && rid !== myId) {
           try { connectTo(rid, false); } catch (e) {}
@@ -2007,7 +2022,10 @@ function onMediaConn(conn) {
           conn.send({
             type: 'status',
             muted: isMuted,
-            speaking: !!me.speaking
+            speaking: !!me.speaking,
+            seq: statusSeq,
+            from: myId,
+            ts: Date.now()
           });
         } catch (e) {
           console.warn('sendStatus failed', e);
@@ -2024,6 +2042,29 @@ function onMediaConn(conn) {
     function broadcastStatus() {
       for (var k in dataConns) {
         if (dataConns.hasOwnProperty(k)) sendStatus(dataConns[k]);
+      }
+    }
+
+    /** 静音状态多次补发，降低弱网丢包导致不同步 */
+    function broadcastStatusReliable() {
+      broadcastStatus();
+      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 80);
+      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 250);
+      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 700);
+    }
+
+    function startStatusSyncLoop() {
+      stopStatusSyncLoop();
+      statusSyncTimer = setInterval(function() {
+        if (intentionalLeave || !peer) return;
+        try { broadcastStatus(); } catch (e) {}
+      }, 4000);
+    }
+
+    function stopStatusSyncLoop() {
+      if (statusSyncTimer) {
+        clearInterval(statusSyncTimer);
+        statusSyncTimer = null;
       }
     }
 
@@ -2388,6 +2429,7 @@ function onMediaConn(conn) {
     /** 断线/离开后回到登录页，并把房间号自动填入输入框（不自动重连） */
     function returnToLoginWithRoomFilled(reason) {
       stopHostWatchdog();
+      stopStatusSyncLoop();
       try {
         window.__meshWasHost = !!isHost || (myId && roomHostId && myId === roomHostId);
         window.__meshLastMyId = myId || window.__meshLastMyId || '';
@@ -2838,6 +2880,7 @@ function attemptRejoinRoom() {
         destroyChatCompletely();
         showSection('roomSection');
         updateUI();
+        startStatusSyncLoop();
         if (isHost) {
           stopHostWatchdog();
           setStatus('已进入（创建者）。等待成员连接；成员端会自动连回本房间号', 'connected');
@@ -2955,27 +2998,35 @@ function attemptRejoinRoom() {
 
     // ========== 静音 / 离开 ==========
     document.getElementById('btnMute').onclick = function() {
-      if (!localStream) return;
+      if (!localStream && !processedStream) return;
       isMuted = !isMuted;
-      localStream.getAudioTracks().forEach(function(t) {
-        t.enabled = !isMuted;
-      });
+      statusSeq++;
+      if (localStream) {
+        localStream.getAudioTracks().forEach(function(t) {
+          t.enabled = !isMuted;
+        });
+      }
       if (processedStream) {
         processedStream.getAudioTracks().forEach(function(t) {
           t.enabled = !isMuted;
         });
       }
       if (outboundGain && audioCtx) {
-        outboundGain.gain.setTargetAtTime(isMuted ? 0 : (noiseGateClosed ? 0 : 1), audioCtx.currentTime, 0.02);
+        try {
+          outboundGain.gain.cancelScheduledValues(audioCtx.currentTime);
+          outboundGain.gain.setValueAtTime(isMuted ? 0 : 1, audioCtx.currentTime);
+          noiseGateClosed = isMuted;
+        } catch (e) {
+          outboundGain.gain.setTargetAtTime(isMuted ? 0 : 1, audioCtx.currentTime, 0.01);
+        }
       }
       document.getElementById('btnMute').textContent = isMuted ? '取消静音' : '静音';
 
-      if (members[myId]) {
-        members[myId].muted = isMuted;
-        if (isMuted) members[myId].speaking = false;
-        updateUI();
-      }
-      broadcastStatus();
+      ensureMember(myId);
+      members[myId].muted = isMuted;
+      if (isMuted) members[myId].speaking = false;
+      updateUI();
+      broadcastStatusReliable();
     };
 
     // ========== 离开房间（可被按钮 / 关闭页面复用） ==========
@@ -3006,6 +3057,7 @@ function attemptRejoinRoom() {
       clearReconnectTimer();
       reconnectAttempts = 0;
       stopHeartbeat();
+      stopStatusSyncLoop();
       if (softDisconnectTimer) { clearTimeout(softDisconnectTimer); softDisconnectTimer = null; }
 
       if (destroyRoomId) {
