@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.5.3（最多4人）</title>
+  <title>Mesh 多人语音 v2.5.4（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.5.3 · 重进有声 · 弱网文件加速</p>
+  <p class="subtitle">v2.5.4 · 弱网保活 · 扬声器双通道 · 静音强同步</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -503,7 +503,9 @@
     var members = {};
     var audioCtx = null;
     var peerReady = false;
-    var volumeMonitors = {}; // id -> { analyser, source, intervalId, dataArray }
+    var volumeMonitors = {};
+    var remoteAudioNodes = {}; // peerId -> {source, gain} WebAudio 兜底播放
+ // id -> { analyser, source, intervalId, dataArray }
     var localMonitorId = null;
     var outboundGain = null;         // GainNode，噪声门控
     var noiseGateClosed = true;
@@ -524,7 +526,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.5.3';
+    var APP_VERSION = '2.5.4';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -1033,6 +1035,32 @@
       }
     }
 
+    function stopRemoteAudioNode(peerId) {
+      var n = remoteAudioNodes[peerId];
+      if (!n) return;
+      try { if (n.source) n.source.disconnect(); } catch (e) {}
+      try { if (n.gain) n.gain.disconnect(); } catch (e2) {}
+      delete remoteAudioNodes[peerId];
+    }
+
+    /** WebAudio 兜底：部分机型 HTML audio 已连接仍无声 */
+    function playRemoteViaWebAudio(stream, peerId) {
+      try {
+        unlockAudio();
+        if (!audioCtx) return;
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        stopRemoteAudioNode(peerId);
+        var source = audioCtx.createMediaStreamSource(stream);
+        var gain = audioCtx.createGain();
+        gain.gain.value = 1.0;
+        source.connect(gain);
+        gain.connect(audioCtx.destination);
+        remoteAudioNodes[peerId] = { source: source, gain: gain };
+      } catch (e) {
+        console.warn('WebAudio remote play failed', peerId, e);
+      }
+    }
+
     function playRemoteStream(stream, peerId) {
       if (!stream || !peerId) return;
       try {
@@ -1053,37 +1081,51 @@
         audio.setAttribute('webkit-playsinline', 'true');
         audioContainer.appendChild(audio);
       }
-      // 不 pause，避免重进后扬声器卡死
-      if (audio.srcObject !== stream) {
+      // 流变化才替换；绝不 pause 导致重进无声
+      try {
+        if (audio.srcObject !== stream) audio.srcObject = stream;
+      } catch (e1) {
         audio.srcObject = stream;
       }
       audio.muted = false;
       audio.volume = 1.0;
 
       unlockAudio();
+      if (audioCtx && audioCtx.state === 'suspended') {
+        try { audioCtx.resume(); } catch (e2) {}
+      }
       startVolumeMonitor(peerId, stream, false);
+      // 双通道：HTML audio + WebAudio，尽量保证能出声
+      playRemoteViaWebAudio(stream, peerId);
 
       function tryPlay(attempt) {
         attempt = attempt || 0;
-        var p = audio.play();
-        if (p && typeof p.then === 'function') {
-          p.then(function() {
-            audio.muted = false;
-            audio.volume = 1.0;
-          }).catch(function() {
-            if (attempt < 4) {
-              setTimeout(function() { tryPlay(attempt + 1); }, 100 * (attempt + 1));
-            } else {
-              setStatus('请点击页面任意处以启用扬声器', 'warning');
-            }
-          });
+        try {
+          audio.muted = false;
+          audio.volume = 1.0;
+          var p = audio.play();
+          if (p && typeof p.then === 'function') {
+            p.then(function() {
+              audio.muted = false;
+              audio.volume = 1.0;
+            }).catch(function() {
+              if (attempt < 6) {
+                setTimeout(function() { tryPlay(attempt + 1); }, 120 * (attempt + 1));
+              } else {
+                setStatus('请点击页面任意处以启用扬声器', 'warning');
+                playRemoteViaWebAudio(stream, peerId);
+              }
+            });
+          }
+        } catch (e3) {
+          if (attempt < 3) setTimeout(function() { tryPlay(attempt + 1); }, 200);
         }
       }
       tryPlay(0);
-      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 100);
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); playRemoteViaWebAudio(stream, peerId); }, 80);
       setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 400);
-      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 1200);
-      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 3000);
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); playRemoteViaWebAudio(stream, peerId); }, 1500);
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 4000);
     }
 
     function createPeerInstance(desiredId) {
@@ -1229,6 +1271,7 @@ function onMediaConn(conn) {
       conn.on('close', function() {
         delete mediaConns[rid];
         stopVolumeMonitor(rid);
+        try { stopRemoteAudioNode(rid); } catch (e) {}
         var a = document.getElementById('audio-' + rid);
         if (a) {
           try { a.srcObject = null; } catch (e) {}
@@ -1994,15 +2037,29 @@ function onMediaConn(conn) {
         if (!data || typeof data !== 'object') return;
 
         if (data.type === 'sync' && data.members) {
-          // 只连真实在线提示的 ID，不把未接通的人先画进列表
           for (var i = 0; i < data.members.length; i++) {
             var id = data.members[i];
             if (!id || id === myId) continue;
             rosterAdd(id);
             if (!isPeerConnAlive(mediaConns[id]) && !isPeerConnAlive(dataConns[id])) {
-              connectTo(id);
+              connectTo(id, false);
             }
           }
+          // 用 sync 携带的静音表强同步（弱网 status 包易丢）
+          if (data.muteMap && typeof data.muteMap === 'object') {
+            for (var mid in data.muteMap) {
+              if (!data.muteMap.hasOwnProperty(mid) || mid === myId) continue;
+              ensureMember(mid);
+              members[mid].muted = !!data.muteMap[mid];
+              members[mid].confirmed = true;
+            }
+          }
+          if (data.from && data.from !== myId && typeof data.myMuted === 'boolean') {
+            ensureMember(data.from);
+            members[data.from].muted = !!data.myMuted;
+            members[data.from].confirmed = true;
+          }
+          updateUI();
           saveActiveRoom();
         }
 
@@ -2062,14 +2119,19 @@ function onMediaConn(conn) {
       if (conn && conn.open) {
         try {
           var list = [];
-          if (myId) list.push(myId);
+          var muteMap = {};
+          if (myId) {
+            list.push(myId);
+            muteMap[myId] = !!isMuted;
+          }
           for (var k in members) {
             if (!members.hasOwnProperty(k) || k === myId) continue;
             if (members[k].confirmed || isPeerConnAlive(mediaConns[k]) || isPeerConnAlive(dataConns[k])) {
               list.push(k);
+              muteMap[k] = !!members[k].muted;
             }
           }
-          conn.send({ type: 'sync', members: list });
+          conn.send({ type: 'sync', members: list, muteMap: muteMap, myMuted: !!isMuted, from: myId, seq: statusSeq });
         } catch (e) {
           console.warn('sendSync failed', e);
         }
@@ -2109,9 +2171,11 @@ function onMediaConn(conn) {
     /** 静音状态多次补发，降低弱网丢包导致不同步 */
     function broadcastStatusReliable() {
       broadcastStatus();
-      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 80);
-      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 250);
-      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 700);
+      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 50);
+      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 150);
+      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 400);
+      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 1000);
+      setTimeout(function() { if (!intentionalLeave) broadcastStatus(); }, 2000);
     }
 
     function startStatusSyncLoop() {
@@ -2119,7 +2183,8 @@ function onMediaConn(conn) {
       statusSyncTimer = setInterval(function() {
         if (intentionalLeave || !peer) return;
         try { broadcastStatus(); } catch (e) {}
-      }, 4000);
+        try { broadcastSync(); } catch (e2) {}
+      }, 2000);
     }
 
     function stopStatusSyncLoop() {
@@ -2178,7 +2243,12 @@ function onMediaConn(conn) {
     function forceConnectTo(remoteId) {
       if (!remoteId || remoteId === myId || !peer) return;
       closeDeadConn(remoteId);
-      if (isPeerConnAlive(mediaConns[remoteId]) && isPeerConnAlive(dataConns[remoteId])) return;
+      // 弱网保活：媒体仍活着就不要强拆重连（避免「显示已连接却突然无声」）
+      if (isPeerConnAlive(mediaConns[remoteId])) {
+        if (!isPeerConnAlive(dataConns[remoteId])) connectTo(remoteId, false);
+        try { ensureRemoteAudioPlaying(remoteId); } catch (e) {}
+        return;
+      }
       connectTo(remoteId, false);
     }
 
@@ -2191,10 +2261,10 @@ function onMediaConn(conn) {
       var needMedia = !(mediaConns[remoteId] && isPeerConnAlive(mediaConns[remoteId]));
       var needData = !(dataConns[remoteId] && isPeerConnAlive(dataConns[remoteId]));
       if (force) {
-        if (mediaConns[remoteId]) { try { mediaConns[remoteId].close(); } catch (e) {} delete mediaConns[remoteId]; }
-        if (dataConns[remoteId]) { try { dataConns[remoteId].close(); } catch (e) {} delete dataConns[remoteId]; }
-        needMedia = true;
-        needData = true;
+        // 仅清理已死连接，不拆仍 alive 的媒体（声音优先）
+        closeDeadConn(remoteId);
+        needMedia = !(mediaConns[remoteId] && isPeerConnAlive(mediaConns[remoteId]));
+        needData = !(dataConns[remoteId] && isPeerConnAlive(dataConns[remoteId]));
       } else {
         closeDeadConn(remoteId);
         needMedia = !(mediaConns[remoteId] && isPeerConnAlive(mediaConns[remoteId]));
@@ -2631,6 +2701,16 @@ function onMediaConn(conn) {
         var stable = isPeerConnStable(m) || isPeerConnStable(d);
         if (stable) {
           onHostLinked('watchdog-stable');
+          try { ensureRemoteAudioPlaying(roomHostId); } catch (e) {}
+          return;
+        }
+
+        // 媒体仍 alive：视为弱网恢复中，只补数据通道 + 拉扬声器，不拆媒体
+        if (isPeerConnAlive(m)) {
+          try { ensureRemoteAudioPlaying(roomHostId); kickAllRemoteAudio(); } catch (e) {}
+          if (!isPeerConnAlive(d)) {
+            try { connectTo(roomHostId, false); } catch (e2) {}
+          }
           return;
         }
 
@@ -2641,8 +2721,11 @@ function onMediaConn(conn) {
 
         if (alive && !stable) {
           if (!hostHalfOpenSince) hostHalfOpenSince = now;
-          if (now - hostHalfOpenSince < 3500) return;
-          console.log('hostWatchdog: half-open timeout, forceConnect');
+          if (now - hostHalfOpenSince < 8000) {
+            try { ensureRemoteAudioPlaying(roomHostId); } catch (e) {}
+            return;
+          }
+          console.log('hostWatchdog: half-open timeout, softConnect');
           hostHalfOpenSince = 0;
           try { forceConnectTo(roomHostId); } catch (e) {}
           if (now - lastHostConnectStatusAt > 5000) {
@@ -2917,23 +3000,29 @@ function attemptRejoinRoom() {
         saveActiveRoom();
 
         if (!isHost) {
-          // 进房立即强制连房主，并短间隔补连（弱网）
-          try { connectTo(roomId, true); } catch (e) {}
+          // 弱网保活：先连上，已有媒体则不再强拆重连
+          try { connectTo(roomId, false); } catch (e) {}
           setTimeout(function() {
-            if (!intentionalLeave && peer && !isHost) {
-              try { connectTo(roomId, true); } catch (e) {}
+            if (!intentionalLeave && peer && !isHost && !isPeerConnAlive(mediaConns[roomId])) {
+              try { connectTo(roomId, false); } catch (e) {}
+            } else {
+              try { kickAllRemoteAudio(); } catch (e2) {}
             }
-          }, 600);
+          }, 800);
           setTimeout(function() {
-            if (!intentionalLeave && peer && !isHost) {
-              try { connectTo(roomId, true); } catch (e) {}
+            if (!intentionalLeave && peer && !isHost && !isPeerConnAlive(mediaConns[roomId])) {
+              try { connectTo(roomId, false); } catch (e) {}
+            } else {
+              try { kickAllRemoteAudio(); } catch (e2) {}
             }
-          }, 2000);
+          }, 2500);
           setTimeout(function() {
-            if (!intentionalLeave && peer && !isHost && !isPeerConnStable(mediaConns[roomId])) {
-              try { connectTo(roomId, true); } catch (e) {}
+            if (!intentionalLeave && peer && !isHost && !isPeerConnAlive(mediaConns[roomId])) {
+              try { connectTo(roomId, false); } catch (e) {}
+            } else {
+              try { kickAllRemoteAudio(); } catch (e2) {}
             }
-          }, 4500);
+          }, 6000);
         }
 
         var roomDisp = document.getElementById('roomIdDisplay');
@@ -3143,6 +3232,12 @@ function attemptRejoinRoom() {
         if (volumeMonitors.hasOwnProperty(mid)) stopVolumeMonitor(mid);
       }
       volumeMonitors = {};
+      for (var ran in remoteAudioNodes) {
+        if (remoteAudioNodes.hasOwnProperty(ran)) {
+          try { stopRemoteAudioNode(ran); } catch (e) {}
+        }
+      }
+      remoteAudioNodes = {};
       if (noiseGateHoldTimer) {
         clearTimeout(noiseGateHoldTimer);
         noiseGateHoldTimer = null;
