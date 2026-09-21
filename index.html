@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.5.0（最多4人）</title>
+  <title>Mesh 多人语音 v2.5.1（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.5.0 · 稳定版 · 无房主迁移 · 防PC爆炸</p>
+  <p class="subtitle">v2.5.1 · 弱网双向建连 · 退出加速</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -520,7 +520,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.5.0';
+    var APP_VERSION = '2.5.1';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -1152,12 +1152,17 @@ function onMediaConn(conn) {
           members[rid].network = 'good';
           members[rid].confirmed = true;
         }
+        rosterAdd(rid);
         playRemoteStream(stream, rid);
         updateUI();
         if (roomHostId && rid === roomHostId && !isHost) {
           onHostLinked('media-stream');
-        } else if (!isHost && rid !== myId) {
-          setStatus('已与成员建立语音', 'connected');
+        } else if (rid !== myId) {
+          setStatus(isHost ? '成员已连入语音' : '已与成员建立语音', 'connected');
+        }
+        // 弱网常见「房主看见成员、成员听不到房主」：收到流后双方都补一次回连
+        if (rid && rid !== myId) {
+          try { connectTo(rid, false); } catch (e) {}
         }
         try { broadcastSync(); } catch (e) {}
       });
@@ -1959,12 +1964,17 @@ function onMediaConn(conn) {
           members[rid].confirmed = true;
           members[rid].network = members[rid].network || 'good';
         }
+        rosterAdd(rid);
         updateUI();
         if (roomHostId && rid === roomHostId && !isHost) {
           onHostLinked('data-open');
         }
         sendSync(conn);
         sendStatus(conn);
+        // 数据通道通了也补媒体，避免只有名单没有声音
+        if (rid && rid !== myId) {
+          try { connectTo(rid, false); } catch (e) {}
+        }
       });
 
       conn.on('close', function() {
@@ -2289,6 +2299,19 @@ function onMediaConn(conn) {
             call.answer(stream);
             onMediaConn(call);
             if (!isReconnecting) setStatus('有人加入', 'connected');
+            // 接听后再主动回拨一次，增强弱网下双向媒体
+            if (rid && rid !== myId) {
+              setTimeout(function() {
+                if (!intentionalLeave && peer) {
+                  try { connectTo(rid, false); } catch (e) {}
+                }
+              }, 400);
+              setTimeout(function() {
+                if (!intentionalLeave && peer && !isPeerConnStable(mediaConns[rid])) {
+                  try { connectTo(rid, true); } catch (e) {}
+                }
+              }, 2500);
+            }
           } catch (err) {
             console.warn('call.answer failed', err);
             setStatus('接听失败: ' + (err.message || err), 'error');
@@ -2514,7 +2537,7 @@ function onMediaConn(conn) {
 
         if (alive && !stable) {
           if (!hostHalfOpenSince) hostHalfOpenSince = now;
-          if (now - hostHalfOpenSince < 6000) return;
+          if (now - hostHalfOpenSince < 3500) return;
           console.log('hostWatchdog: half-open timeout, forceConnect');
           hostHalfOpenSince = 0;
           try { forceConnectTo(roomHostId); } catch (e) {}
@@ -2530,20 +2553,21 @@ function onMediaConn(conn) {
         if (now < hostConnectBackoffUntil) return;
 
         hostConnectFailStreak++;
-        var delay = Math.min(12000, 1500 * Math.pow(1.6, Math.min(hostConnectFailStreak - 1, 4)));
+        // 弱网下缩短退避，避免长时间「看得到人却连不上」
+        var delay = Math.min(5000, 800 * Math.pow(1.35, Math.min(hostConnectFailStreak - 1, 5)));
         hostConnectBackoffUntil = now + delay;
 
         console.log('hostWatchdog: forceConnect', roomHostId, 'streak', hostConnectFailStreak);
-        try { forceConnectTo(roomHostId); } catch (e) {}
+        try { connectTo(roomHostId, true); } catch (e) {}
 
-        if (now - lastHostConnectStatusAt > 5000) {
+        if (now - lastHostConnectStatusAt > 3000) {
           lastHostConnectStatusAt = now;
-          setStatus('正在连接创建者（约 ' + Math.round(delay / 1000) + 's 后可再试）…', 'warning');
+          setStatus('正在连接房主…', 'warning');
         }
       }
 
-      setTimeout(tick, 500);
-      hostWatchdogTimer = setInterval(tick, 2000);
+      setTimeout(tick, 300);
+      hostWatchdogTimer = setInterval(tick, 1500);
     }
 
 function attemptRejoinRoom() {
@@ -2789,8 +2813,23 @@ function attemptRejoinRoom() {
         saveActiveRoom();
 
         if (!isHost) {
-          // 进房只连房间号；名单里的旧 ID 不立刻全连，避免幽灵用户与误踢
-          connectTo(roomId);
+          // 进房立即强制连房主，并短间隔补连（弱网）
+          try { connectTo(roomId, true); } catch (e) {}
+          setTimeout(function() {
+            if (!intentionalLeave && peer && !isHost) {
+              try { connectTo(roomId, true); } catch (e) {}
+            }
+          }, 600);
+          setTimeout(function() {
+            if (!intentionalLeave && peer && !isHost) {
+              try { connectTo(roomId, true); } catch (e) {}
+            }
+          }, 2000);
+          setTimeout(function() {
+            if (!intentionalLeave && peer && !isHost && !isPeerConnStable(mediaConns[roomId])) {
+              try { connectTo(roomId, true); } catch (e) {}
+            }
+          }, 4500);
         }
 
         var roomDisp = document.getElementById('roomIdDisplay');
@@ -3044,8 +3083,38 @@ function attemptRejoinRoom() {
     }
 
     document.getElementById('btnLeave').onclick = function() {
-      // 主动离开：销毁本机会话中的房间绑定（全员都离开后房间即结束）
-      leaveRoom(false, true);
+      // 先切界面，避免弱网下 peer.destroy 卡住导致按钮「没反应」
+      var btn = document.getElementById('btnLeave');
+      if (btn) btn.disabled = true;
+      setStatus('正在退出…', 'warning');
+      try {
+        intentionalLeave = true;
+        stopHostWatchdog();
+        stopHeartbeat();
+      } catch (e) {}
+      // 立即回登录区并回填房间号
+      try {
+        var keepRoom = roomHostId ||
+          (document.getElementById('roomIdDisplay') || {}).textContent ||
+          (document.getElementById('hostIdInput') || {}).value || '';
+        if (keepRoom === '-') keepRoom = '';
+        showSection('initSection');
+        if (keepRoom) {
+          document.getElementById('hostIdInput').value = keepRoom;
+          var box = document.getElementById('createdRoomBox');
+          var disp = document.getElementById('createdRoomIdDisplay');
+          if (disp) disp.textContent = keepRoom;
+          if (box) box.style.display = 'block';
+          window.__meshLastRoom = keepRoom;
+        }
+        setStatus('已离开，房间号已填入，可再次点「进入房间」');
+      } catch (e2) {}
+      // 后台清理连接（不阻塞按钮）
+      setTimeout(function() {
+        try { leaveRoom(false, true); } catch (e3) {}
+        var b = document.getElementById('btnLeave');
+        if (b) b.disabled = false;
+      }, 0);
     };
 
     document.getElementById('btnDissolve').onclick = function() {
