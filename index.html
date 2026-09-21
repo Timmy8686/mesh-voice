@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.5.2（最多4人）</title>
+  <title>Mesh 多人语音 v2.5.3（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.5.2 · 静音同步加固 · 文件传输加速</p>
+  <p class="subtitle">v2.5.3 · 重进有声 · 弱网文件加速</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -513,16 +513,18 @@
     var chatMessages = [];           // { id, from, name, text?, fileName?, fileUrl?, fileSize?, ts, type }
     var chatFileUrls = [];           // 需 revoke 的 ObjectURL
     var MAX_FILE_BYTES = 200 * 1024 * 1024; // 200MB
-    var FILE_CHUNK_SIZE = 256 * 1024;     // 256KB：减少片数与往返
-    var FILE_BUFFER_HIGH = 4 * 1024 * 1024; // ~4MB 背压阈值（更大在途）
-    var FILE_PARALLEL = 8;                 // 同时在途分片数
+    // 弱网优先、尽量快：中等分片 + 中等并行，避免 256KB×8 易堵死
+    var FILE_CHUNK_SIZE = 128 * 1024;      // 128KB
+    var FILE_BUFFER_HIGH = 2.5 * 1024 * 1024; // ~2.5MB 背压
+    var FILE_PARALLEL = 5;                 // 并行窗口
+    var FILE_PARALLEL_MIN = 2;             // 弱网降级下限
     var fileTransferBusy = false;
     var outgoingFileQueue = [];
     var activeSendCancel = false;
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.5.2';
+    var APP_VERSION = '2.5.3';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -995,7 +997,51 @@
       }
     }
 
+    function ensureRemoteAudioPlaying(peerId) {
+      var audio = document.getElementById('audio-' + peerId);
+      if (!audio) return;
+      try {
+        audio.muted = false;
+        audio.volume = 1.0;
+        if (audio.srcObject) {
+          var tracks = audio.srcObject.getAudioTracks ? audio.srcObject.getAudioTracks() : [];
+          for (var i = 0; i < tracks.length; i++) {
+            try { tracks[i].enabled = true; } catch (e) {}
+          }
+        }
+        if (audio.paused) {
+          var p = audio.play();
+          if (p && p.catch) p.catch(function() {});
+        }
+      } catch (e) {}
+    }
+
+    function kickAllRemoteAudio() {
+      try { unlockAudio(); } catch (e) {}
+      if (!audioContainer) return;
+      var list = audioContainer.querySelectorAll('audio');
+      for (var i = 0; i < list.length; i++) {
+        var a = list[i];
+        try {
+          a.muted = false;
+          a.volume = 1.0;
+          if (a.paused) a.play().catch(function() {});
+        } catch (e2) {}
+      }
+      for (var pid in mediaConns) {
+        if (mediaConns.hasOwnProperty(pid)) ensureRemoteAudioPlaying(pid);
+      }
+    }
+
     function playRemoteStream(stream, peerId) {
+      if (!stream || !peerId) return;
+      try {
+        var tracks = stream.getAudioTracks ? stream.getAudioTracks() : [];
+        for (var ti = 0; ti < tracks.length; ti++) {
+          try { tracks[ti].enabled = true; } catch (e) {}
+        }
+      } catch (e0) {}
+
       var audioId = 'audio-' + peerId;
       var audio = document.getElementById(audioId);
       if (!audio) {
@@ -1005,30 +1051,39 @@
         audio.playsInline = true;
         audio.setAttribute('playsinline', 'true');
         audio.setAttribute('webkit-playsinline', 'true');
-        audio.muted = false;
-        audio.volume = 1.0;
         audioContainer.appendChild(audio);
       }
-      try { audio.pause(); } catch (e) {}
-      audio.srcObject = stream;
+      // 不 pause，避免重进后扬声器卡死
+      if (audio.srcObject !== stream) {
+        audio.srcObject = stream;
+      }
+      audio.muted = false;
+      audio.volume = 1.0;
 
-      // 开始监听远端音量（用于「正在说话」）
       unlockAudio();
       startVolumeMonitor(peerId, stream, false);
 
-      var p = audio.play();
-      if (p && typeof p.then === 'function') {
-        p.then(function() {
-          console.log('音频播放成功:', peerId);
-        }).catch(function() {
-          audio.muted = true;
-          audio.play().then(function() {
-            setTimeout(function() { audio.muted = false; }, 300);
+      function tryPlay(attempt) {
+        attempt = attempt || 0;
+        var p = audio.play();
+        if (p && typeof p.then === 'function') {
+          p.then(function() {
+            audio.muted = false;
+            audio.volume = 1.0;
           }).catch(function() {
-            setStatus('请点击页面任意处以启用声音', 'warning');
+            if (attempt < 4) {
+              setTimeout(function() { tryPlay(attempt + 1); }, 100 * (attempt + 1));
+            } else {
+              setStatus('请点击页面任意处以启用扬声器', 'warning');
+            }
           });
-        });
+        }
       }
+      tryPlay(0);
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 100);
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 400);
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 1200);
+      setTimeout(function() { ensureRemoteAudioPlaying(peerId); }, 3000);
     }
 
     function createPeerInstance(desiredId) {
@@ -1155,7 +1210,9 @@ function onMediaConn(conn) {
           members[rid].confirmed = true;
         }
         rosterAdd(rid);
+        try { unlockAudio(); } catch (e) {}
         playRemoteStream(stream, rid);
+        setTimeout(function() { ensureRemoteAudioPlaying(rid); }, 50);
         updateUI();
         if (roomHostId && rid === roomHostId && !isHost) {
           onHostLinked('media-stream');
@@ -1462,7 +1519,7 @@ function onMediaConn(conn) {
     /** 背压：优先等 bufferedamountlow，避免盲等 */
     function waitConnDrain(conn, timeoutMs) {
       return new Promise(function(resolve) {
-        timeoutMs = timeoutMs || 1200;
+        timeoutMs = timeoutMs || 1500;
         if (!conn || !conn.open) return resolve(false);
         if (getConnBufferedAmount(conn) < FILE_BUFFER_HIGH) return resolve(true);
 
@@ -1633,6 +1690,7 @@ function onMediaConn(conn) {
         var inFlight = 0;
         var completed = 0;
         var ended = false;
+        var parallelWin = FILE_PARALLEL;
 
         function readChunk(idx) {
           return new Promise(function(resolve, reject) {
@@ -1687,7 +1745,7 @@ function onMediaConn(conn) {
             return;
           }
 
-          while (inFlight < FILE_PARALLEL && nextIndex < totalChunks && !activeSendCancel) {
+          while (inFlight < parallelWin && nextIndex < totalChunks && !activeSendCancel) {
             (function(idx) {
               inFlight++;
               readChunk(idx).then(function(buf) {
@@ -1698,7 +1756,7 @@ function onMediaConn(conn) {
                 }
                 // 所有对端背压就绪后再发这一片
                 return Promise.all(peers.map(function(p) {
-                  return waitConnDrain(p.conn, 1200);
+                  return waitConnDrain(p.conn, 1500);
                 })).then(function() {
                   if (activeSendCancel) return;
                   peers = getOpenDataConnList();
@@ -1723,8 +1781,11 @@ function onMediaConn(conn) {
                   finishAll();
                   return;
                 }
-                // 单片失败：略延迟后继续泵，避免整文件卡死
-                setTimeout(pump, 50);
+                // 弱网：失败时略降并行，延迟再泵
+                if (parallelWin > FILE_PARALLEL_MIN) {
+                  parallelWin = Math.max(FILE_PARALLEL_MIN, parallelWin - 1);
+                }
+                setTimeout(pump, 80);
               });
             })(nextIndex++);
           }
@@ -2532,6 +2593,7 @@ function onMediaConn(conn) {
     /** 成员已与创建者（房间号）连通：立刻更新状态，去掉「稍后重试」残留文案 */
     function onHostLinked(reason) {
       if (isHost || !roomHostId) return;
+      try { ensureRemoteAudioPlaying(roomHostId); kickAllRemoteAudio(); } catch (e) {}
       hostConnectFailStreak = 0;
       hostConnectBackoffUntil = 0;
       hostHalfOpenSince = 0;
@@ -2881,6 +2943,17 @@ function attemptRejoinRoom() {
         showSection('roomSection');
         updateUI();
         startStatusSyncLoop();
+        try { unlockAudio(); } catch (e) {}
+        // 重进后 15 秒内多次拉起扬声器，避免「显示已连接但无声」
+        var audioKickTimes = [200, 600, 1500, 3000, 6000, 10000, 15000];
+        for (var aki = 0; aki < audioKickTimes.length; aki++) {
+          (function(ms) {
+            setTimeout(function() {
+              if (intentionalLeave) return;
+              kickAllRemoteAudio();
+            }, ms);
+          })(audioKickTimes[aki]);
+        }
         if (isHost) {
           stopHostWatchdog();
           setStatus('已进入（创建者）。等待成员连接；成员端会自动连回本房间号', 'connected');
@@ -2891,7 +2964,8 @@ function attemptRejoinRoom() {
 
         setTimeout(function() {
           if (!intentionalLeave && peer && !isHost) {
-            connectTo(roomId);
+            connectTo(roomId, true);
+            kickAllRemoteAudio();
           }
         }, 2000);
       }).catch(function(err) {
@@ -3206,12 +3280,7 @@ function attemptRejoinRoom() {
 
     document.body.addEventListener('click', function() {
       unlockAudio();
-      var audios = audioContainer.querySelectorAll('audio');
-      for (var i = 0; i < audios.length; i++) {
-        if (audios[i].paused) {
-          audios[i].play().catch(function() {});
-        }
-      }
+      kickAllRemoteAudio();
     });
 
     // ========== 启动时加载 PeerJS ==========
