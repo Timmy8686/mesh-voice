@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Mesh 多人语音 v2.4.0（最多4人）</title>
+  <title>Mesh 多人语音 v2.4.1（最多4人）</title>
   <style>
     :root {
       --bg: #0b0f14;
@@ -328,7 +328,7 @@
 </head>
 <body>
   <h1>🔒 Mesh 多人语音</h1>
-  <p class="subtitle">v2.4.0 · 最多 4 人 · 创建者离开后短时互连（无竞选）</p>
+  <p class="subtitle">v2.4.1 · 最多 4 人 · 修复脚本语法与组件加载</p>
 
   <div class="card">
     <div id="status" class="status">正在加载组件...</div>
@@ -407,31 +407,55 @@
       'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js'
     ];
 
-    function loadScript(url) {
+    function loadScript(url, timeoutMs) {
+      timeoutMs = timeoutMs || 8000;
       return new Promise(function(resolve, reject) {
+        var done = false;
         var s = document.createElement('script');
         s.src = url;
         s.async = true;
-        s.onload = function() { resolve(url); };
-        s.onerror = function() { reject(new Error('加载失败: ' + url)); };
+        var timer = setTimeout(function() {
+          if (done) return;
+          done = true;
+          try { s.onload = s.onerror = null; } catch (e) {}
+          reject(new Error('加载超时: ' + url));
+        }, timeoutMs);
+        s.onload = function() {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve(url);
+        };
+        s.onerror = function() {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          reject(new Error('加载失败: ' + url));
+        };
         document.head.appendChild(s);
       });
     }
 
-    async function loadPeerJS() {
-      if (typeof Peer !== 'undefined') return true;
-      for (var i = 0; i < PEERJS_CDNS.length; i++) {
-        try {
-          await loadScript(PEERJS_CDNS[i]);
+    function loadPeerJS() {
+      if (typeof Peer !== 'undefined') return Promise.resolve(true);
+      var i = 0;
+      function tryNext() {
+        if (typeof Peer !== 'undefined') return Promise.resolve(true);
+        if (i >= PEERJS_CDNS.length) return Promise.resolve(false);
+        var url = PEERJS_CDNS[i++];
+        setStatus('正在加载组件（' + i + '/' + PEERJS_CDNS.length + '）…');
+        return loadScript(url, 8000).then(function() {
           if (typeof Peer !== 'undefined') {
-            console.log('PeerJS 加载成功:', PEERJS_CDNS[i]);
+            console.log('PeerJS 加载成功:', url);
             return true;
           }
-        } catch (e) {
-          console.warn(e.message);
-        }
+          return tryNext();
+        }).catch(function(e) {
+          console.warn(e.message || e);
+          return tryNext();
+        });
       }
-      return false;
+      return tryNext();
     }
 
     // ========== 主逻辑 ==========
@@ -492,7 +516,7 @@
     var activeSendFileId = null;
     var incomingFiles = {};          // id -> { chunks, fileName, fileSize, mime, from, received }
     var isHost = false;              // 创建房间者为房主，可用于提示
-    var APP_VERSION = '2.4.0';
+    var APP_VERSION = '2.4.1';
     // 弱网保活（仿 Zoom：先局部恢复，再整房重连）
     var networkQuality = 'mid'; // good | mid | poor
     var heartbeatTimer = null;
@@ -3272,6 +3296,9 @@ function attemptRejoinRoom() {
     function startRoomNodeElection(reason) {
       // v2.4.0：已取消竞选，仅短时互连
       startHostAbsentGrace(reason || 'legacy-election');
+    }
+
+    function __legacy_election_disabled_start() {
       return;
       /* legacy election disabled
 
@@ -3316,11 +3343,15 @@ function attemptRejoinRoom() {
     }
 
     */
+    } // end __legacy_election_disabled_start
+
     function tryBecomeRoomNode(reason) {
       // 已禁用节点迁移
-      electionInProgress = false;
       isMigratingRoomNode = false;
       startHostAbsentGrace(reason || 'legacy-migrate');
+    }
+
+    function __legacy_migrate_disabled() {
       return;
       /*
 
@@ -3440,6 +3471,8 @@ function attemptRejoinRoom() {
     }
 
     /** 清理幽灵成员：未确认的直接删；已确认但连接彻底 failed/closed 的也删 */
+    } // end __legacy_migrate_disabled
+
     function pruneGhostMembers() {
       var changed = false;
       for (var id in members) {
@@ -3693,6 +3726,10 @@ function attemptRejoinRoom() {
         peerReady = false;
         setStatus('组件加载失败，请检查网络后刷新页面（可能是 CDN 被拦截）', 'error');
       }
+    }).catch(function(err) {
+      console.error(err);
+      peerReady = false;
+      setStatus('组件加载异常: ' + (err && err.message ? err.message : err), 'error');
     });
   </script>
 </body>
